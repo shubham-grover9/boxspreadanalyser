@@ -1,0 +1,3 @@
+flask
+fyers-apiv3
+gunicorn
