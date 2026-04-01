@@ -548,10 +548,11 @@ function setFilter(f){
   if(activeExpiry&&cache[activeExpiry]) renderResults(cache[activeExpiry]);
 }
 
+const REFRESH_SEC = {{ refresh_sec }};
 let _poll=null;
 function startPolling(){
   if(_poll) clearInterval(_poll);
-  const interval = allExpiries.length ? {{refresh_sec}}*1000 : 5000;
+  const interval = allExpiries.length ? REFRESH_SEC*1000 : 5000;
   _poll=setInterval(async()=>{
     const hadData=allExpiries.length>0;
     await loadExpiries();
