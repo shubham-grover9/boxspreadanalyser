@@ -1,7 +1,3 @@
-"""
-NIFTY Box Spread Arbitrage Analyzer v2 — Multi-Expiry + Fyers API v3
-"""
-
 import os, json, time, threading, hashlib, secrets
 from datetime import datetime, date
 from flask import Flask, render_template_string, request, redirect, jsonify, session, url_for
@@ -13,7 +9,7 @@ FYERS_CLIENT_ID  = os.environ.get("FYERS_CLIENT_ID", "")
 FYERS_SECRET_KEY = os.environ.get("FYERS_SECRET_KEY", "")
 ADMIN_PASSWORD   = os.environ.get("ADMIN_PASSWORD", "changeme")
 APP_URL          = os.environ.get("APP_URL", "http://localhost:5000")
-REFRESH_SECONDS  = int(os.environ.get("REFRESH_SECONDS", "60"))
+REFRESH_SEC      = int(os.environ.get("REFRESH_SECONDS", "60"))
 
 PARAMS = {
     "lot_size":       int(os.environ.get("LOT_SIZE", "75")),
@@ -32,20 +28,17 @@ PARAMS = {
 }
 
 state = {
-    "expiries":     [],   # list of display strings e.g. "07-Apr-2026"
-    "raw_map":      {},   # display_str -> raw value from Fyers
-    "data":         {},   # display_str -> {results, cmp, dte, ...}
-    "access_token": None,
-    "token_date":   None,
-    "global_error": None,
+    "expiries": [], "raw_map": {}, "data": {},
+    "access_token": None, "token_date": None, "global_error": None,
+    "last_fetch": None,
 }
 
 TOKEN_FILE = "/tmp/fyers_token.json"
 
-# ── TOKEN HELPERS ─────────────────────────────────────────────────────────────
+# ── AUTH ──────────────────────────────────────────────────────────────────────
 def save_token(token):
     state["access_token"] = token
-    state["token_date"]   = str(date.today())
+    state["token_date"] = str(date.today())
     try:
         with open(TOKEN_FILE, "w") as f:
             json.dump({"token": token, "date": str(date.today())}, f)
@@ -60,7 +53,7 @@ def load_token():
             d = json.load(f)
         if d.get("date") == str(date.today()):
             state["access_token"] = d["token"]
-            state["token_date"]   = d["date"]
+            state["token_date"] = d["date"]
             return d["token"]
     except Exception:
         pass
@@ -69,38 +62,28 @@ def load_token():
 def is_authenticated():
     return bool(load_token())
 
-# ── EXPIRY HELPERS ────────────────────────────────────────────────────────────
-def expiry_to_display(raw):
-    """Convert Fyers expiry value (Unix timestamp int or date string) to display string."""
+def expiry_display(raw):
     try:
-        ts = int(raw)
-        return datetime.fromtimestamp(ts).strftime("%d-%b-%Y")
-    except (ValueError, TypeError):
-        pass
-    return str(raw)
+        return datetime.fromtimestamp(int(raw)).strftime("%d-%b-%Y")
+    except Exception:
+        return str(raw)
 
-def expiry_to_dte(raw):
-    """Days to expiry from a Fyers raw expiry value."""
+def expiry_dte(raw):
     try:
-        ts = int(raw)
-        exp = datetime.fromtimestamp(ts).date()
-        return max(1, (exp - date.today()).days)
-    except (ValueError, TypeError):
-        pass
-    try:
-        exp = datetime.strptime(str(raw), "%d-%b-%Y").date()
-        return max(1, (exp - date.today()).days)
+        return max(1, (datetime.fromtimestamp(int(raw)).date() - date.today()).days)
     except Exception:
         pass
-    return 30
+    try:
+        return max(1, (datetime.strptime(str(raw), "%d-%b-%Y").date() - date.today()).days)
+    except Exception:
+        return 30
 
-# ── FYERS AUTH ────────────────────────────────────────────────────────────────
 def get_auth_url():
     try:
         from fyers_apiv3 import fyersModel
         s = fyersModel.SessionModel(
             client_id=FYERS_CLIENT_ID, secret_key=FYERS_SECRET_KEY,
-            redirect_uri=f"{APP_URL}/callback",
+            redirect_uri=APP_URL + "/callback",
             response_type="code", grant_type="authorization_code",
         )
         return s.generate_authcode()
@@ -112,7 +95,7 @@ def exchange_code(auth_code):
         from fyers_apiv3 import fyersModel
         s = fyersModel.SessionModel(
             client_id=FYERS_CLIENT_ID, secret_key=FYERS_SECRET_KEY,
-            redirect_uri=f"{APP_URL}/callback",
+            redirect_uri=APP_URL + "/callback",
             response_type="code", grant_type="authorization_code",
         )
         s.set_token(auth_code)
@@ -122,201 +105,163 @@ def exchange_code(auth_code):
         state["global_error"] = str(e)
         return None
 
-# ── BOX SPREAD ENGINE ─────────────────────────────────────────────────────────
+# ── CALC ──────────────────────────────────────────────────────────────────────
 def calc_pair(r1, r2, dte):
-    p    = PARAMS
-    ca1  = r1.get("ca")
-    pb1  = r1.get("pb")
-    cb2  = r2.get("cb")
-    pa2  = r2.get("pa")
+    p = PARAMS
+    ca1 = r1.get("ca"); pb1 = r1.get("pb")
+    cb2 = r2.get("cb"); pa2 = r2.get("pa")
     if any(v is None for v in [ca1, pb1, cb2, pa2]):
         return None
-
     k1, k2 = r1["k"], r2["k"]
-    lots   = p["lot_size"] * p["num_lots"]
-    box_w  = k2 - k1
-    nd     = (ca1 + pa2 - cb2 - pb1) * lots
-    bv     = box_w * lots
-    estt   = (p["stt_entry_pct"] / 100) * (cb2 + pb1) * lots
-    sstt   = (p["stt_settl_pct"] / 100) * bv
-    tp     = (ca1 + pa2 + cb2 + pb1) * lots
-    other  = (
-        (p["txn_pct"]  / 100) * tp +
-        (p["sebi_pct"] / 100) * tp +
-        4 * p["broker_per_leg"] * (1 + p["gst_pct"] / 100) +
-        (p["stamp_pct"] / 100) * (ca1 + pa2) * lots +
-        4 * p["slip_per_leg"] * lots
-    )
-    net    = bv - nd - estt - sstt - other
-    ret    = (net / nd * 100) if nd else 0
-    ann    = (ret * 365 / dte) if dte else 0
-
+    lots = p["lot_size"] * p["num_lots"]
+    box_w = k2 - k1
+    nd = (ca1 + pa2 - cb2 - pb1) * lots
+    bv = box_w * lots
+    estt = (p["stt_entry_pct"] / 100) * (cb2 + pb1) * lots
+    sstt = (p["stt_settl_pct"] / 100) * bv
+    tp = (ca1 + pa2 + cb2 + pb1) * lots
+    other = ((p["txn_pct"] / 100) * tp + (p["sebi_pct"] / 100) * tp +
+             4 * p["broker_per_leg"] * (1 + p["gst_pct"] / 100) +
+             (p["stamp_pct"] / 100) * (ca1 + pa2) * lots +
+             4 * p["slip_per_leg"] * lots)
+    net = bv - nd - estt - sstt - other
+    ret = (net / nd * 100) if nd else 0
+    ann = (ret * 365 / dte) if dte else 0
     cb1 = r1.get("cb"); ca2 = r2.get("ca")
     pa1 = r1.get("pa"); pb2 = r2.get("pb")
-    sp  = None
+    sp = None
     if all(v is not None for v in [ca1, cb1, ca2, cb2, pa1, pb1, pa2, pb2]):
         sp = ((ca1-cb1) + (ca2-cb2) + (pa1-pb1) + (pa2-pb2)) / box_w * 100
-
-    if net <= 0:
-        sig = "loss"
-    elif ann < p["min_ann_ret"]:
-        sig = "borderline"
-    elif sp is not None and sp < p["max_spread_pct"]:
-        sig = "execute"
-    else:
-        sig = "borderline"
-
+    if net <= 0: sig = "loss"
+    elif ann < p["min_ann_ret"]: sig = "borderline"
+    elif sp is not None and sp < p["max_spread_pct"]: sig = "execute"
+    else: sig = "borderline"
     return {
         "k1": k1, "k2": k2, "box_w": box_w,
-        "net_debit":   round(nd,    0),
-        "box_value":   round(bv,    0),
-        "entry_stt":   round(estt,  0),
-        "settl_stt":   round(sstt,  0),
-        "other_costs": round(other, 0),
-        "net_pnl":     round(net,   0),
-        "ret_pct":     round(ret,   2),
-        "ann_ret":     round(ann,   2),
-        "spread_pct":  round(sp,    2) if sp is not None else None,
-        "signal":      sig,
+        "ca1": ca1, "cb2": cb2, "pa2": pa2, "pb1": pb1,
+        "net_debit": round(nd, 0), "box_value": round(bv, 0),
+        "entry_stt": round(estt, 0), "settl_stt": round(sstt, 0),
+        "other_costs": round(other, 0), "net_pnl": round(net, 0),
+        "ret_pct": round(ret, 2), "ann_ret": round(ann, 2),
+        "spread_pct": round(sp, 2) if sp is not None else None,
+        "signal": sig,
     }
 
-# ── FETCH ONE EXPIRY ──────────────────────────────────────────────────────────
-def fetch_one_expiry(fyers, raw_expiry):
-    """Fetch option chain for one expiry (raw value from Fyers) and return analysis."""
+def fetch_one(fyers, raw_expiry):
     try:
         resp = fyers.optionchain(data={
-            "symbol":      "NSE:NIFTY50-INDEX",
+            "symbol": "NSE:NIFTY50-INDEX",
             "strikecount": "25",
-            "timestamp":   str(raw_expiry),
+            "timestamp": str(raw_expiry),
         })
-
         if resp.get("s") != "ok":
-            return {"error": f"API: {resp.get('message', str(resp))}", "results": [], "cmp": None}
-
+            return {"error": resp.get("message", "API error"), "chain": [], "pairs": [], "cmp": None}
         opt = resp.get("data", {})
         cmp = opt.get("ltp")
-
-        chain = {}
+        chain_dict = {}
         for row in opt.get("optionChain", []):
             k = row.get("strikePrice")
-            if k is None:
-                continue
-            if k not in chain:
-                chain[k] = {"k": k, "cb": None, "ca": None, "pb": None, "pa": None}
+            if k is None: continue
+            if k not in chain_dict:
+                chain_dict[k] = {"k": k, "cb": None, "ca": None, "pb": None, "pa": None,
+                                  "civ": None, "piv": None, "coi": None, "poi": None}
             ot = row.get("option_type")
             if ot == "CE":
-                chain[k]["cb"] = row.get("bid_price")
-                chain[k]["ca"] = row.get("ask_price")
+                chain_dict[k]["cb"] = row.get("bid_price")
+                chain_dict[k]["ca"] = row.get("ask_price")
+                chain_dict[k]["civ"] = row.get("iv")
+                chain_dict[k]["coi"] = row.get("oi")
             elif ot == "PE":
-                chain[k]["pb"] = row.get("bid_price")
-                chain[k]["pa"] = row.get("ask_price")
-
-        strikes = sorted(chain.values(), key=lambda x: x["k"])
-        dte     = expiry_to_dte(raw_expiry)
-        results = []
-        for i in range(len(strikes)):
-            for j in range(i + 1, len(strikes)):
-                r = calc_pair(strikes[i], strikes[j], dte)
-                if r:
-                    results.append(r)
-        results.sort(key=lambda x: x["ann_ret"], reverse=True)
-
-        return {
-            "results":    results,
-            "cmp":        cmp,
-            "dte":        dte,
-            "last_fetch": datetime.now().strftime("%H:%M:%S"),
-            "error":      None,
-        }
-
+                chain_dict[k]["pb"] = row.get("bid_price")
+                chain_dict[k]["pa"] = row.get("ask_price")
+                chain_dict[k]["piv"] = row.get("iv")
+                chain_dict[k]["poi"] = row.get("oi")
+        chain = sorted(chain_dict.values(), key=lambda x: x["k"])
+        dte = expiry_dte(raw_expiry)
+        pairs = []
+        for i in range(len(chain)):
+            for j in range(i + 1, len(chain)):
+                r = calc_pair(chain[i], chain[j], dte)
+                if r: pairs.append(r)
+        pairs.sort(key=lambda x: x["ann_ret"], reverse=True)
+        return {"error": None, "chain": chain, "pairs": pairs, "cmp": cmp, "dte": dte}
     except Exception as e:
-        return {"error": str(e), "results": [], "cmp": None, "last_fetch": None, "dte": None}
+        return {"error": str(e), "chain": [], "pairs": [], "cmp": None, "dte": None}
 
-# ── FETCH ALL EXPIRIES ────────────────────────────────────────────────────────
-def fetch_all_expiries():
+def fetch_all():
     token = load_token()
     if not token:
-        state["global_error"] = "No access token — admin login required."
+        state["global_error"] = "No token — visit /admin to login."
         return
     try:
         from fyers_apiv3 import fyersModel
         fyers = fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=token, log_path="")
-
-        # Get list of all expiries
         resp = fyers.optionchain(data={"symbol": "NSE:NIFTY50-INDEX", "strikecount": "1", "timestamp": ""})
         if resp.get("s") != "ok":
-            state["global_error"] = f"Fyers API: {resp.get('message')}"
+            state["global_error"] = resp.get("message", "API error")
             return
-
         raw_expiries = [e["expiry"] for e in resp.get("data", {}).get("expiryData", [])]
-        if not raw_expiries:
-            state["global_error"] = "No expiries returned by Fyers API."
-            return
-
-        # Build display names and raw mapping
-        expiry_displays = []
-        raw_map         = {}
-        for raw in raw_expiries:
-            display = expiry_to_display(raw)
-            expiry_displays.append(display)
-            raw_map[display] = raw
-
-        state["expiries"]     = expiry_displays
-        state["raw_map"]      = raw_map
+        displays = [expiry_display(r) for r in raw_expiries]
+        state["expiries"] = displays
+        state["raw_map"] = {expiry_display(r): r for r in raw_expiries}
         state["global_error"] = None
-
-        # Fetch chain for each expiry
-        for display in expiry_displays:
-            raw    = raw_map[display]
-            result = fetch_one_expiry(fyers, raw)
-            state["data"][display] = result
+        for disp in displays:
+            raw = state["raw_map"][disp]
+            state["data"][disp] = fetch_one(fyers, raw)
             time.sleep(0.4)
-
+        state["last_fetch"] = datetime.now().strftime("%H:%M:%S")
     except Exception as e:
         state["global_error"] = str(e)
 
 def refresh_loop():
     while True:
         if is_authenticated():
-            fetch_all_expiries()
-        time.sleep(REFRESH_SECONDS)
+            fetch_all()
+        time.sleep(REFRESH_SEC)
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def inr(v, dec=0):
+    if v is None: return "—"
+    neg = v < 0
+    s = "₹{:,.{}f}".format(abs(v), dec)
+    return ("−" if neg else "") + s
+
+def pct(v, dec=2):
+    if v is None: return "—"
+    return "{:+.{}f}%".format(v, dec)
+
+def num(v, dec=2):
+    if v is None: return "—"
+    return "{:.{}f}".format(v, dec)
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template_string(DASHBOARD_HTML, refresh_sec=REFRESH_SECONDS)
-
-@app.route("/api/expiries")
-def api_expiries():
-    return jsonify({
-        "expiries":      state["expiries"],
-        "authenticated": is_authenticated(),
-        "global_error":  state["global_error"],
-        "refresh_sec":   REFRESH_SECONDS,
-    })
-
-@app.route("/api/data/<path:expiry>")
-def api_data(expiry):
-    d   = state["data"].get(expiry, {})
-    res = d.get("results", [])
-    arb  = sum(1 for r in res if r["signal"] == "execute")
-    bord = sum(1 for r in res if r["signal"] == "borderline")
-    best = max((r["net_pnl"] for r in res), default=None)
-    mxa  = max((r["ann_ret"] for r in res), default=None)
-    return jsonify({
-        "expiry":    expiry,
-        "results":   res,
-        "last_fetch": d.get("last_fetch"),
-        "error":     d.get("error"),
-        "cmp":       d.get("cmp"),
-        "dte":       d.get("dte"),
-        "params":    PARAMS,
-        "scorecard": {
-            "total": len(res), "arb": arb, "borderline": bord,
-            "loss": len(res) - arb - bord,
-            "best_pnl": best, "max_ann": mxa,
-        },
-    })
+    active = request.args.get("expiry") or (state["expiries"][0] if state["expiries"] else None)
+    d = state["data"].get(active, {}) if active else {}
+    chain = d.get("chain", [])
+    pairs = d.get("pairs", [])
+    sig_filter = request.args.get("sig", "all")
+    if sig_filter != "all":
+        pairs = [p for p in pairs if p["signal"] == sig_filter]
+    arb = sum(1 for p in d.get("pairs", []) if p["signal"] == "execute")
+    bord = sum(1 for p in d.get("pairs", []) if p["signal"] == "borderline")
+    loss = sum(1 for p in d.get("pairs", []) if p["signal"] == "loss")
+    best = max((p["net_pnl"] for p in d.get("pairs", [])), default=None)
+    maxann = max((p["ann_ret"] for p in d.get("pairs", [])), default=None)
+    return render_template_string(PAGE,
+        expiries=state["expiries"], active=active,
+        d=d, chain=chain, pairs=pairs,
+        arb=arb, bord=bord, loss=loss,
+        total=len(d.get("pairs", [])),
+        best=best, maxann=maxann,
+        params=PARAMS, inr=inr, pct=pct, num=num,
+        last_fetch=state["last_fetch"],
+        global_error=state["global_error"],
+        authenticated=is_authenticated(),
+        sig_filter=sig_filter,
+        refresh_sec=REFRESH_SEC,
+    )
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
@@ -325,302 +270,318 @@ def admin():
         if hashlib.sha256(pw.encode()).hexdigest() == hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest():
             session["admin"] = True
             return redirect(url_for("admin"))
-        return render_template_string(ADMIN_HTML, error="Wrong password", logged_in=False, state=state, auth_url=None)
+        return render_template_string(ADMIN_PAGE, error="Wrong password", logged_in=False, state=state, auth_url=None)
     if not session.get("admin"):
-        return render_template_string(ADMIN_HTML, error=None, logged_in=False, state=state, auth_url=None)
-    return render_template_string(ADMIN_HTML, error=None, logged_in=True, state=state, auth_url=get_auth_url())
+        return render_template_string(ADMIN_PAGE, error=None, logged_in=False, state=state, auth_url=None)
+    return render_template_string(ADMIN_PAGE, error=None, logged_in=True, state=state, auth_url=get_auth_url())
 
 @app.route("/callback")
 def callback():
     auth_code = request.args.get("auth_code")
     if not auth_code:
-        return "<h2>No auth code received.</h2><a href='/admin'>Back</a>"
+        return "<h2>No auth code.</h2><a href='/admin'>Back</a>"
     token = exchange_code(auth_code)
     if token:
         save_token(token)
-        threading.Thread(target=fetch_all_expiries, daemon=True).start()
+        threading.Thread(target=fetch_all, daemon=True).start()
         return redirect("/admin?success=1")
-    return f"<h2>Token exchange failed.</h2><p>{state['global_error']}</p><a href='/admin'>Back</a>"
+    return "<h2>Token exchange failed.</h2><a href='/admin'>Back</a>"
 
 @app.route("/admin/logout")
 def admin_logout():
     session.pop("admin", None)
     return redirect("/admin")
 
-# ── DASHBOARD HTML ─────────────────────────────────────────────────────────────
-DASHBOARD_HTML = """<!DOCTYPE html>
+# ── MAIN PAGE ─────────────────────────────────────────────────────────────────
+PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="{{ refresh_sec }}">
 <title>NIFTY Box Spread — Live</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;background:#f4f6f9;color:#1a1a1a}
-.topbar{background:#0f172a;padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
-.title{font-size:16px;font-weight:700;color:#f8fafc}
-.subtitle{font-size:11px;color:#94a3b8;margin-top:2px}
-.status{display:flex;align-items:center;gap:8px;font-size:12px;color:#94a3b8}
-.dot{width:8px;height:8px;border-radius:50%;background:#475569}
-.dot.live{background:#22c55e;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.main{padding:20px 24px;max-width:1400px;margin:0 auto}
-.expiry-bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;align-items:center}
-.expiry-label{font-size:11px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
-.eb{padding:5px 14px;border-radius:6px;border:1px solid #e2e8f0;background:#fff;cursor:pointer;font-size:12px;color:#475569;font-weight:500;font-family:inherit}
-.eb:hover{border-color:#94a3b8}
-.eb.active{background:#0f172a;color:#fff;border-color:#0f172a}
-.arb-badge{display:inline-block;margin-left:5px;background:#dcfce7;color:#15803d;border-radius:3px;padding:1px 5px;font-size:10px;font-weight:700}
-.eb.active .arb-badge{background:#22c55e;color:#fff}
-.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px}
-@media(max-width:800px){.cards{grid-template-columns:repeat(2,1fr)}}
-.card{background:#fff;border-radius:10px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,.07)}
-.cl{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px}
-.cv{font-size:22px;font-weight:700;font-family:'Courier New',monospace}
-.cv.g{color:#16a34a}.cv.a{color:#d97706}.cv.r{color:#dc2626}.cv.b{color:#2563eb}
-.section{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);margin-bottom:16px;overflow:hidden}
-.sechdr{padding:12px 18px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:13px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
-.filters{display:flex;gap:6px;flex-wrap:wrap}
-.fb{padding:4px 12px;border-radius:5px;border:1px solid #e2e8f0;background:#fff;cursor:pointer;font-size:12px;color:#64748b;font-family:inherit}
-.fb.active{background:#0f172a;color:#fff;border-color:#0f172a}
-.tbl-wrap{overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{background:#f8fafc;padding:8px 12px;text-align:right;font-size:11px;color:#475569;font-weight:700;border-bottom:2px solid #e2e8f0;white-space:nowrap;text-transform:uppercase;letter-spacing:.4px}
-th:first-child,th:nth-child(2){text-align:left}
-td{padding:7px 12px;border-bottom:1px solid #f1f5f9;text-align:right;font-family:'Courier New',monospace;white-space:nowrap}
-td:first-child,td:nth-child(2){text-align:left;font-family:inherit;font-weight:600;color:#0f172a}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;background:#f0f2f5;color:#1a1a1a}
+.topbar{background:#0f172a;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.t1{font-size:15px;font-weight:700;color:#f8fafc}
+.t2{font-size:11px;color:#94a3b8;margin-top:2px}
+.live{display:flex;align-items:center;gap:6px;font-size:12px;color:#94a3b8}
+.dot{width:7px;height:7px;border-radius:50%;background:{% if authenticated and not global_error %}#22c55e{% else %}#ef4444{% endif %}}
+.main{padding:16px 20px;max-width:1500px;margin:0 auto}
+.err{background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px 14px;color:#b91c1c;font-size:12px;margin-bottom:12px}
+/* Expiry bar */
+.ebar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;align-items:center}
+.elabel{font-size:11px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.eb{padding:4px 12px;border-radius:5px;border:1px solid #e2e8f0;background:#fff;text-decoration:none;font-size:12px;color:#475569;font-weight:500}
+.eb:hover{border-color:#94a3b8;color:#0f172a}
+.eb.on{background:#0f172a;color:#fff;border-color:#0f172a}
+.arbn{display:inline-block;margin-left:4px;background:#dcfce7;color:#15803d;border-radius:3px;padding:1px 4px;font-size:10px;font-weight:700}
+.eb.on .arbn{background:#22c55e;color:#fff}
+/* Scorecard */
+.cards{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}
+@media(max-width:900px){.cards{grid-template-columns:repeat(3,1fr)}}
+.card{background:#fff;border-radius:9px;padding:12px 14px;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.cl{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
+.cv{font-size:20px;font-weight:700;font-family:'Courier New',monospace}
+.g{color:#16a34a}.a{color:#d97706}.r{color:#dc2626}.b{color:#2563eb}
+/* Section */
+.sec{background:#fff;border-radius:9px;box-shadow:0 1px 2px rgba(0,0,0,.06);margin-bottom:14px;overflow:hidden}
+.sh{padding:10px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:13px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.sb{padding:14px 16px}
+/* Assumptions grid */
+.agrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+@media(max-width:800px){.agrid{grid-template-columns:repeat(2,1fr)}}
+.arow{background:#f8fafc;border-radius:6px;padding:8px 10px;display:flex;justify-content:space-between;align-items:center}
+.ak{font-size:11px;color:#64748b}
+.av{font-size:13px;font-weight:600;font-family:'Courier New',monospace;color:#0f172a}
+/* Tables */
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+th{background:#f1f5f9;padding:7px 10px;text-align:right;font-size:10px;color:#475569;font-weight:700;border-bottom:2px solid #e2e8f0;white-space:nowrap;text-transform:uppercase;letter-spacing:.3px}
+th.l{text-align:left}
+td{padding:6px 10px;border-bottom:1px solid #f1f5f9;text-align:right;font-family:'Courier New',monospace;white-space:nowrap}
+td.l{text-align:left;font-family:inherit;font-weight:600}
 tr:hover td{background:#f8fafc}
-.pill{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;font-family:inherit}
-.pill-g{background:#dcfce7;color:#15803d}
-.pill-a{background:#fef3c7;color:#92400e}
-.pill-r{background:#fee2e2;color:#b91c1c}
-.empty{text-align:center;padding:48px;color:#94a3b8;font-size:13px}
-.ref{font-size:11px;color:#94a3b8;white-space:nowrap}
+.pill{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:700;font-family:inherit}
+.pg{background:#dcfce7;color:#15803d}
+.pa{background:#fef3c7;color:#92400e}
+.pr{background:#fee2e2;color:#b91c1c}
+.ps{background:#f1f5f9;color:#64748b}
+/* filters */
+.fbar{display:flex;gap:5px;flex-wrap:wrap}
+.fb{padding:3px 10px;border-radius:4px;border:1px solid #e2e8f0;background:#fff;text-decoration:none;font-size:11px;color:#64748b}
+.fb:hover{border-color:#94a3b8}
+.fb.on{background:#0f172a;color:#fff;border-color:#0f172a}
+.empty{text-align:center;padding:40px;color:#94a3b8;font-size:13px}
+.ref{font-size:11px;color:#94a3b8}
+.na{color:#94a3b8}
 </style>
 </head>
 <body>
 <div class="topbar">
   <div>
-    <div class="title">NIFTY Box Spread Arbitrage Scanner</div>
-    <div class="subtitle" id="subtitle">Loading...</div>
-  </div>
-  <div class="status"><div class="dot" id="dot"></div><span id="statusTxt">Connecting</span></div>
-</div>
-<div class="main">
-  <div class="expiry-bar" id="expiryBar"><span class="expiry-label">Expiry</span><span style="font-size:12px;color:#94a3b8">Loading expiries...</span></div>
-  <div id="scoreCards" class="cards"></div>
-  <div class="section">
-    <div class="sechdr">
-      <span id="tableTitle">Results</span>
-      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-        <div class="filters" id="filterBtns"></div>
-        <span class="ref" id="refreshInfo"></span>
-      </div>
+    <div class="t1">NIFTY Box Spread Arbitrage Scanner</div>
+    <div class="t2">
+      {% if active %}{{ active }} &nbsp;·&nbsp; DTE: {{ d.get('dte','?') }} &nbsp;·&nbsp; CMP: ₹{{ "{:,.0f}".format(d.get('cmp',0) or 0) }} &nbsp;·&nbsp; Lot: {{ params.lot_size }}{% else %}Waiting for data...{% endif %}
     </div>
-    <div><div class="tbl-wrap">
-      <table>
-        <thead><tr>
-          <th style="text-align:left">K1</th>
-          <th style="text-align:left">K2</th>
-          <th>Width</th><th>DTE</th>
-          <th>Net Debit</th><th>Box Value</th>
-          <th>Entry STT</th><th>Settl. STT</th><th>Other Costs</th>
-          <th>Net P&amp;L</th><th>Return%</th><th>Ann.%</th>
-          <th>Spread%</th><th>Signal</th>
-        </tr></thead>
-        <tbody id="tBody"><tr><td colspan="14"><div class="empty">Select an expiry above</div></td></tr></tbody>
-      </table>
-    </div></div>
   </div>
-  <div style="text-align:center;font-size:11px;color:#94a3b8;padding-bottom:24px">
-    Live data via Fyers API v3 &nbsp;·&nbsp; NSE European-style cash-settled index options &nbsp;·&nbsp; Not financial advice
+  <div class="live">
+    <div class="dot"></div>
+    {% if not authenticated %}Not authenticated — <a href="/admin" style="color:#60a5fa">login</a>
+    {% elif global_error %}<span style="color:#f87171">{{ global_error }}</span>
+    {% else %}Live &nbsp;·&nbsp; Updated {{ last_fetch or '...' }} &nbsp;·&nbsp; Auto-refreshes every {{ refresh_sec }}s{% endif %}
   </div>
 </div>
-<script>
-let filter='all', allExpiries=[], activeExpiry=null, cache={};
-const fi=(v,d=0)=>v==null?'—':(v<0?'−':'')+'₹'+Math.abs(v).toFixed(d).replace(/\B(?=(\d{3})+(?!\d))/g,',');
-const fp=v=>v==null?'—':(v>=0?'+':'')+v.toFixed(2)+'%';
-const pills={execute:'pill-g',borderline:'pill-a',loss:'pill-r'};
-const plabs={execute:'EXECUTE',borderline:'BORDERLINE',loss:'AVOID'};
 
-async function loadExpiries(){
-  try{
-    const r=await fetch('/api/expiries');
-    const d=await r.json();
-    allExpiries=d.expiries||[];
-    document.getElementById('dot').className=d.global_error?'dot':'dot live';
-    document.getElementById('statusTxt').textContent=d.global_error||('Live · refreshes every '+d.refresh_sec+'s');
-    document.getElementById('refreshInfo').textContent='Auto-refreshes every '+d.refresh_sec+'s';
-    renderExpiryBar();
-    if(allExpiries.length&&!activeExpiry){
-      activeExpiry=allExpiries[0];
-      await loadExpiry(activeExpiry);
-    }
-  }catch(e){
-    document.getElementById('statusTxt').textContent='Connection error';
-  }
-}
+<div class="main">
+{% if global_error %}<div class="err">{{ global_error }}</div>{% endif %}
 
-async function loadExpiry(exp){
-  activeExpiry=exp;
-  renderExpiryBar();
-  document.getElementById('tBody').innerHTML='<tr><td colspan="14"><div class="empty">Loading '+exp+'...</div></td></tr>';
-  try{
-    const r=await fetch('/api/data/'+encodeURIComponent(exp));
-    const d=await r.json();
-    cache[exp]=d;
-    document.getElementById('subtitle').textContent=
-      exp+' · '+(d.dte||'?')+' days · CMP ₹'+(d.cmp||0).toLocaleString('en-IN')+'  · Lot '+(d.params?.lot_size||75);
-    renderResults(d);
-    renderExpiryBar();
-  }catch(e){
-    document.getElementById('tBody').innerHTML='<tr><td colspan="14"><div class="empty">Error loading data</div></td></tr>';
-  }
-}
+<!-- EXPIRY TABS -->
+<div class="ebar">
+  <span class="elabel">Expiry</span>
+  {% if expiries %}
+    {% for e in expiries %}
+      {% set ed = state_data.get(e, {}) %}
+      {% set en = ed.get('arb_count', 0) %}
+      <a href="/?expiry={{ e }}&sig={{ sig_filter }}" class="eb {% if e == active %}on{% endif %}">
+        {{ e }}{% if en > 0 %}<span class="arbn">{{ en }}</span>{% endif %}
+      </a>
+    {% endfor %}
+  {% else %}
+    <span style="font-size:12px;color:#94a3b8">{% if authenticated %}Loading expiries...{% else %}Login at <a href="/admin">/admin</a> to load data{% endif %}</span>
+  {% endif %}
+</div>
 
-function renderExpiryBar(){
-  const bar=document.getElementById('expiryBar');
-  if(!allExpiries.length){
-    bar.innerHTML='<span class="expiry-label">Expiry</span><span style="font-size:12px;color:#94a3b8">Waiting for data...</span>';
-    return;
-  }
-  bar.innerHTML='<span class="expiry-label">Expiry</span>'+allExpiries.map(e=>{
-    const c=cache[e];
-    const n=c?.scorecard?.arb;
-    const badge=n>0?'<span class="arb-badge">'+n+'</span>':'';
-    return '<button class="eb'+(e===activeExpiry?' active':'')+'" onclick="loadExpiry(\''+e+'\')">'+e+badge+'</button>';
-  }).join('');
-}
+<!-- SCORECARD -->
+<div class="cards">
+  <div class="card"><div class="cl">Complete Pairs</div><div class="cv b">{{ total }}</div></div>
+  <div class="card"><div class="cl">Arbitrage ✔</div><div class="cv g">{{ arb }}</div></div>
+  <div class="card"><div class="cl">Borderline ⚠</div><div class="cv a">{{ bord }}</div></div>
+  <div class="card"><div class="cl">Loss ✘</div><div class="cv r">{{ loss }}</div></div>
+  <div class="card"><div class="cl">Best P&L/lot</div><div class="cv g" style="font-size:14px">{{ inr(best) }}</div></div>
+  <div class="card"><div class="cl">Max Ann. Return</div><div class="cv g" style="font-size:14px">{{ pct(maxann) }}</div></div>
+</div>
 
-function renderResults(d){
-  const s=d.scorecard||{};
-  document.getElementById('scoreCards').innerHTML=[
-    ['Complete pairs',s.total,'b'],
-    ['Arbitrage',s.arb,'g'],
-    ['Borderline',s.borderline,'a'],
-    ['Best P&L/lot',fi(s.best_pnl),'g'],
-    ['Max ann. return',fp(s.max_ann),'g'],
-  ].map(([l,v,c])=>'<div class="card"><div class="cl">'+l+'</div><div class="cv '+c+'" style="font-size:'+(typeof v==="string"&&v.length>6?'14px':'22px')+'">'+v+'</div></div>').join('');
+<!-- ASSUMPTIONS -->
+<div class="sec">
+  <div class="sh">Assumptions (read-only)</div>
+  <div class="sb">
+    <div class="agrid">
+      <div class="arow"><span class="ak">Lot Size (NIFTY)</span><span class="av">{{ params.lot_size }} units</span></div>
+      <div class="arow"><span class="ak">Number of Lots</span><span class="av">{{ params.num_lots }}</span></div>
+      <div class="arow"><span class="ak">Brokerage per Leg</span><span class="av">₹{{ params.broker_per_leg }}</span></div>
+      <div class="arow"><span class="ak">GST on Brokerage</span><span class="av">{{ params.gst_pct }}%</span></div>
+      <div class="arow"><span class="ak">Entry STT (sell legs)</span><span class="av">{{ params.stt_entry_pct }}%</span></div>
+      <div class="arow"><span class="ak">Settlement STT</span><span class="av">{{ params.stt_settl_pct }}%</span></div>
+      <div class="arow"><span class="ak">NSE Txn Charge</span><span class="av">{{ params.txn_pct }}%</span></div>
+      <div class="arow"><span class="ak">SEBI Charge</span><span class="av">{{ params.sebi_pct }}%</span></div>
+      <div class="arow"><span class="ak">Stamp Duty (buy side)</span><span class="av">{{ params.stamp_pct }}%</span></div>
+      <div class="arow"><span class="ak">Slippage per Leg</span><span class="av">{{ params.slip_per_leg }} pts</span></div>
+      <div class="arow"><span class="ak">Risk-Free Rate</span><span class="av">{{ params.rfr }}%</span></div>
+      <div class="arow"><span class="ak">Min Ann. Return</span><span class="av">{{ params.min_ann_ret }}%</span></div>
+      <div class="arow"><span class="ak">Max Spread %</span><span class="av">{{ params.max_spread_pct }}%</span></div>
+      <div class="arow"><span class="ak">Fixed Cost/Box (excl STT)</span><span class="av">₹{{ "%.2f"|format(4 * params.broker_per_leg * (1 + params.gst_pct/100)) }}</span></div>
+    </div>
+  </div>
+</div>
 
-  const res=d.results||[];
-  const fc={
-    all:res.length,
-    execute:res.filter(r=>r.signal==='execute').length,
-    borderline:res.filter(r=>r.signal==='borderline').length,
-    loss:res.filter(r=>r.signal==='loss').length
-  };
-  document.getElementById('filterBtns').innerHTML=
-    Object.keys(fc).map(k=>'<button class="fb'+(filter===k?' active':'')+'" onclick="setFilter(\''+k+'\')">'+
-      k.charAt(0).toUpperCase()+k.slice(1)+' ('+fc[k]+')</button>').join('');
-  document.getElementById('tableTitle').textContent=
-    activeExpiry+' — '+res.length+' complete pairs · DTE: '+(d.dte||'?');
+<!-- OPTION CHAIN -->
+{% if chain %}
+<div class="sec">
+  <div class="sh">
+    <span>Option Chain — {{ active }} ({{ chain|length }} strikes)</span>
+    <span class="ref">Buy at Ask · Sell at Bid</span>
+  </div>
+  <div class="tw">
+    <table>
+      <thead><tr>
+        <th class="l">Strike (K)</th>
+        <th>Call Bid</th><th>Call Ask</th><th>Call Mid</th>
+        <th>Call IV%</th><th>Call OI</th>
+        <th>Put Bid</th><th>Put Ask</th><th>Put Mid</th>
+        <th>Put IV%</th><th>Put OI</th>
+        <th>Status</th>
+      </tr></thead>
+      <tbody>
+      {% for s in chain %}
+        {% set cmid = ((s.cb or 0) + (s.ca or 0)) / 2 if s.cb and s.ca else None %}
+        {% set pmid = ((s.pb or 0) + (s.pa or 0)) / 2 if s.pb and s.pa else None %}
+        {% set ok = s.cb is not none and s.ca is not none and s.pb is not none and s.pa is not none %}
+        <tr>
+          <td class="l" style="font-weight:700">{{ "{:,}".format(s.k|int) }}</td>
+          <td>{% if s.cb is not none %}{{ "%.2f"|format(s.cb) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if s.ca is not none %}{{ "%.2f"|format(s.ca) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if cmid is not none %}{{ "%.2f"|format(cmid) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if s.civ is not none %}{{ "%.1f"|format(s.civ) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if s.coi is not none %}{{ "{:,}".format(s.coi|int) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if s.pb is not none %}{{ "%.2f"|format(s.pb) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if s.pa is not none %}{{ "%.2f"|format(s.pa) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if pmid is not none %}{{ "%.2f"|format(pmid) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if s.piv is not none %}{{ "%.1f"|format(s.piv) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if s.poi is not none %}{{ "{:,}".format(s.poi|int) }}{% else %}<span class="na">—</span>{% endif %}</td>
+          <td>{% if ok %}<span class="pill pg">✔ Active</span>{% else %}<span class="pill ps">⚠ Partial</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
 
-  const f=(filter==='all'?res:res.filter(r=>r.signal===filter))
-    .sort((a,b)=>b.ann_ret-a.ann_ret);
+<!-- BOX SPREAD ANALYSIS -->
+<div class="sec">
+  <div class="sh">
+    <span>Box Spread Analysis — {{ total }} complete pairs</span>
+    <div class="fbar">
+      <a href="/?expiry={{ active }}&sig=all"   class="fb {% if sig_filter=='all' %}on{% endif %}">All ({{ total }})</a>
+      <a href="/?expiry={{ active }}&sig=execute"    class="fb {% if sig_filter=='execute' %}on{% endif %}">✔ Execute ({{ arb }})</a>
+      <a href="/?expiry={{ active }}&sig=borderline" class="fb {% if sig_filter=='borderline' %}on{% endif %}">⚠ Borderline ({{ bord }})</a>
+      <a href="/?expiry={{ active }}&sig=loss"       class="fb {% if sig_filter=='loss' %}on{% endif %}">✘ Loss ({{ loss }})</a>
+    </div>
+  </div>
+  <div class="tw">
+    <table>
+      <thead><tr>
+        <th class="l">K1</th><th class="l">K2</th><th>Width</th><th>DTE</th>
+        <th>C Ask(K1)</th><th>C Bid(K2)</th><th>P Ask(K2)</th><th>P Bid(K1)</th>
+        <th>Net Debit</th><th>Box Value</th>
+        <th>Entry STT</th><th>Settl. STT</th><th>Other Costs</th>
+        <th>Net P&L</th><th>Return%</th><th>Ann.%</th><th>Spread%</th><th>Signal</th>
+      </tr></thead>
+      <tbody>
+      {% if pairs %}
+        {% for p in pairs %}
+        <tr>
+          <td class="l">{{ "{:,}".format(p.k1|int) }}</td>
+          <td class="l">{{ "{:,}".format(p.k2|int) }}</td>
+          <td>{{ "{:,}".format(p.box_w|int) }}</td>
+          <td>{{ d.get('dte','?') }}</td>
+          <td>{{ "%.2f"|format(p.ca1) }}</td>
+          <td>{{ "%.2f"|format(p.cb2) }}</td>
+          <td>{{ "%.2f"|format(p.pa2) }}</td>
+          <td>{{ "%.2f"|format(p.pb1) }}</td>
+          <td>{{ inr(p.net_debit) }}</td>
+          <td>{{ inr(p.box_value) }}</td>
+          <td>{{ inr(p.entry_stt) }}</td>
+          <td>{{ inr(p.settl_stt) }}</td>
+          <td>{{ inr(p.other_costs) }}</td>
+          <td style="font-weight:700;color:{% if p.net_pnl >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(p.net_pnl) }}</td>
+          <td style="color:{% if p.ret_pct >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.ret_pct) }}</td>
+          <td style="font-weight:700;color:{% if p.ann_ret >= 1 %}#16a34a{% elif p.ann_ret >= 0 %}#d97706{% else %}#dc2626{% endif %}">{{ pct(p.ann_ret) }}</td>
+          <td>{% if p.spread_pct is not none %}{{ "%.2f"|format(p.spread_pct) }}%{% else %}—{% endif %}</td>
+          <td>
+            {% if p.signal == 'execute' %}<span class="pill pg">✅ EXECUTE</span>
+            {% elif p.signal == 'borderline' %}<span class="pill pa">⚠ BORDERLINE</span>
+            {% else %}<span class="pill pr">❌ AVOID</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      {% else %}
+        <tr><td colspan="18"><div class="empty">{% if not authenticated %}Login at /admin to load data{% elif not active %}Select an expiry above{% else %}No complete pairs for this expiry{% endif %}</div></td></tr>
+      {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
 
-  if(!f.length){
-    document.getElementById('tBody').innerHTML=
-      '<tr><td colspan="14"><div class="empty">'+(d.error?'Error: '+d.error:'No complete pairs with all 4 legs priced')+'</div></td></tr>';
-    return;
-  }
-
-  document.getElementById('tBody').innerHTML=f.map(r=>
-    '<tr>'+
-    '<td>'+r.k1.toLocaleString('en-IN')+'</td>'+
-    '<td>'+r.k2.toLocaleString('en-IN')+'</td>'+
-    '<td>'+r.box_w.toLocaleString('en-IN')+'</td>'+
-    '<td>'+(d.dte||'?')+'</td>'+
-    '<td>'+fi(r.net_debit)+'</td>'+
-    '<td>'+fi(r.box_value)+'</td>'+
-    '<td>'+fi(r.entry_stt)+'</td>'+
-    '<td>'+fi(r.settl_stt)+'</td>'+
-    '<td>'+fi(r.other_costs)+'</td>'+
-    '<td style="color:'+(r.net_pnl>=0?'#16a34a':'#dc2626')+';font-weight:700">'+fi(r.net_pnl)+'</td>'+
-    '<td style="color:'+(r.ret_pct>=0?'#16a34a':'#dc2626')+'">'+fp(r.ret_pct)+'</td>'+
-    '<td style="color:'+(r.ann_ret>=1?'#16a34a':r.ann_ret>=0?'#d97706':'#dc2626')+';font-weight:700">'+fp(r.ann_ret)+'</td>'+
-    '<td>'+(r.spread_pct!=null?r.spread_pct.toFixed(2)+'%':'—')+'</td>'+
-    '<td><span class="pill '+pills[r.signal]+'">'+plabs[r.signal]+'</span></td>'+
-    '</tr>'
-  ).join('');
-}
-
-function setFilter(f){
-  filter=f;
-  if(activeExpiry&&cache[activeExpiry]) renderResults(cache[activeExpiry]);
-}
-
-const REFRESH_SEC = {{ refresh_sec }};
-let _poll=null;
-function startPolling(){
-  if(_poll) clearInterval(_poll);
-  const interval = allExpiries.length ? REFRESH_SEC*1000 : 5000;
-  _poll=setInterval(async()=>{
-    const hadData=allExpiries.length>0;
-    await loadExpiries();
-    if(activeExpiry) loadExpiry(activeExpiry);
-    if(!hadData && allExpiries.length>0) startPolling();
-  }, interval);
-}
-loadExpiries().then(startPolling);
-</script>
+<div style="text-align:center;font-size:11px;color:#94a3b8;padding-bottom:20px">
+  Live data via Fyers API v3 &nbsp;·&nbsp; NSE European-style cash-settled index options &nbsp;·&nbsp; Not financial advice &nbsp;·&nbsp; Page auto-refreshes every {{ refresh_sec }}s
+</div>
+</div>
 </body></html>"""
 
-# ── ADMIN HTML ─────────────────────────────────────────────────────────────────
-ADMIN_HTML = """<!DOCTYPE html>
+ADMIN_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Admin</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,sans-serif;background:#f1f5f9;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
 .box{background:#fff;border-radius:12px;padding:36px;width:100%;max-width:480px;box-shadow:0 4px 20px rgba(0,0,0,.1)}
-h1{font-size:20px;margin-bottom:6px}
-p{font-size:13px;color:#64748b;margin-bottom:20px;line-height:1.5}
+h1{font-size:20px;margin-bottom:6px}p{font-size:13px;color:#64748b;margin-bottom:20px;line-height:1.5}
 label{display:block;font-size:12px;color:#64748b;margin-bottom:4px;font-weight:600}
 input[type=password]{width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:6px;font-size:14px;margin-bottom:14px}
 .btn{display:block;width:100%;padding:11px;background:#0f172a;color:#fff;border:none;border-radius:7px;font-size:14px;font-weight:600;cursor:pointer;text-align:center;text-decoration:none;margin-bottom:8px}
-.btn-fyers{background:#ff6600}.btn-fyers:hover{background:#e55a00}
-.err{background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:10px;color:#b91c1c;font-size:13px;margin-bottom:14px}
+.btn-f{background:#ff6600}.err{background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:10px;color:#b91c1c;font-size:13px;margin-bottom:14px}
 .ok{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px;color:#15803d;font-size:13px;margin-bottom:14px}
 .stat{background:#f8fafc;border-radius:8px;padding:14px;font-size:12px;color:#475569;margin-bottom:16px;line-height:2}
-.stat b{color:#0f172a}
-hr{border:none;border-top:1px solid #e2e8f0;margin:20px 0}
-a{color:#2563eb;font-size:13px}
-</style></head>
-<body><div class="box">
+.stat b{color:#0f172a}hr{border:none;border-top:1px solid #e2e8f0;margin:20px 0}a{color:#2563eb;font-size:13px}
+</style></head><body><div class="box">
   <h1>Scanner Admin</h1>
-  <p>Only for you — share the main URL (<a href="/">/</a>) with everyone else.</p>
+  <p>Only for you. Share the main URL (<a href="/">/</a>) with everyone else.</p>
   {% if not logged_in %}
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
-    <form method="POST">
-      <label>Admin password</label>
-      <input type="password" name="password" autofocus>
-      <button type="submit" class="btn">Login</button>
-    </form>
+    <form method="POST"><label>Admin password</label>
+    <input type="password" name="password" autofocus>
+    <button type="submit" class="btn">Login</button></form>
   {% else %}
-    {% if request.args.get('success') %}
-    <div class="ok">✓ Fyers login successful! Fetching all expiries now.</div>
-    {% endif %}
+    {% if request.args.get('success') %}<div class="ok">✓ Fyers login successful! Fetching all expiries now.</div>{% endif %}
     <div class="stat">
-      <b>Auth:</b> {{ '✓ Token active today' if state.access_token else '✗ No token — login required' }}<br>
-      <b>Expiries loaded:</b> {{ state.expiries|length }}
-      {% if state.expiries %}({{ ', '.join(state.expiries[:4]) }}{% if state.expiries|length > 4 %}...{% endif %}){% endif %}<br>
+      <b>Auth:</b> {{ '✓ Token active today' if state.access_token else '✗ No token' }}<br>
+      <b>Expiries:</b> {{ state.expiries|length }} loaded{% if state.expiries %} ({{ ', '.join(state.expiries[:3]) }}...){% endif %}<br>
+      <b>Last fetch:</b> {{ state.last_fetch or 'Never' }}<br>
       {% if state.global_error %}<b>Error:</b> <span style="color:#dc2626">{{ state.global_error }}</span>{% endif %}
     </div>
-    <p style="font-size:12px;color:#64748b;margin-bottom:12px">Fyers tokens expire daily at midnight. Click below each morning before market opens.</p>
-    {% if auth_url %}
-    <a href="{{ auth_url }}" class="btn btn-fyers">Login with Fyers (refresh token) →</a>
-    {% endif %}
-    <hr>
-    <a href="/">← Dashboard</a> &nbsp;·&nbsp; <a href="/admin/logout">Logout</a>
+    <p style="font-size:12px;color:#64748b;margin-bottom:12px">Fyers tokens expire at midnight. Click below each morning before market opens.</p>
+    {% if auth_url %}<a href="{{ auth_url }}" class="btn btn-f">Login with Fyers (refresh token) →</a>{% endif %}
+    <hr><a href="/">← Dashboard</a> &nbsp;·&nbsp; <a href="/admin/logout">Logout</a>
   {% endif %}
 </div></body></html>"""
 
-# ── STARTUP ────────────────────────────────────────────────────────────────────
 def startup():
     if is_authenticated():
-        print("✓ Token found — fetching all expiries")
-        threading.Thread(target=fetch_all_expiries, daemon=True).start()
+        print("Token found — fetching data")
+        threading.Thread(target=fetch_all, daemon=True).start()
     else:
-        print("⚠ No token — visit /admin to login with Fyers")
+        print("No token — visit /admin")
     threading.Thread(target=refresh_loop, daemon=True).start()
+
+# Pass state_data to template via context processor
+@app.context_processor
+def inject_state():
+    sd = {}
+    for exp, d in state["data"].items():
+        sd[exp] = {"arb_count": sum(1 for p in d.get("pairs", []) if p["signal"] == "execute")}
+    return {"state_data": sd, "state": state}
 
 startup()
 
