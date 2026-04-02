@@ -257,7 +257,14 @@ def fetch_one(fyers, raw_expiry):
             symbols_needed = set()
             for p in top_candidates:
                 # Build Fyers option symbols for the 4 legs
-                exp_str = expiry_display(raw_expiry).upper().replace("-","")
+                # Fyers format: NSE:NIFTY{YY}{MON}{STRIKE}{TYPE} e.g. NSE:NIFTY26JUN25000CE
+                disp = expiry_display(raw_expiry)  # e.g. "30-Jun-2026"
+                try:
+                    from datetime import datetime as _dt
+                    _d = _dt.strptime(disp, "%d-%b-%Y")
+                    exp_str = _d.strftime("%y%b").upper()  # e.g. "26JUN"
+                except Exception:
+                    exp_str = disp.upper().replace("-","")
                 symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k1'])}CE")
                 symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k2'])}CE")
                 symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k1'])}PE")
@@ -270,7 +277,13 @@ def fetch_one(fyers, raw_expiry):
             # Add impact cost to top candidates
             lots = PARAMS["lot_size"] * PARAMS["num_lots"]
             for p in top_candidates:
-                exp_str = expiry_display(raw_expiry).upper().replace("-","")
+                disp2 = expiry_display(raw_expiry)
+                try:
+                    from datetime import datetime as _dt2
+                    _d2 = _dt2.strptime(disp2, "%d-%b-%Y")
+                    exp_str = _d2.strftime("%y%b").upper()
+                except Exception:
+                    exp_str = disp2.upper().replace("-","")
                 ic = calc_impact_cost(
                     depth_map,
                     f"NSE:NIFTY{exp_str}{int(p['k1'])}CE", "buy",  lots,  # Buy Call K1
@@ -749,6 +762,90 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
     </div>
   </form>
 </div>
+
+<!-- EXECUTE SUMMARY -->
+{% if arb > 0 and active %}
+<div class="sec" style="border-left:4px solid #16a34a">
+  <div class="sh sh-static" style="background:#f0fdf4">
+    <span style="color:#15803d">✅ {{ arb }} Executable Spread{{ 's' if arb > 1 else '' }} Found — {{ active }}</span>
+    <span style="font-size:11px;color:#15803d;font-weight:400">All conditions met: P&L > 0, Ann% ≥ {{ params.min_ann_ret }}%, Spread% &lt; {{ params.max_spread_pct }}%</span>
+  </div>
+  <div class="sb" style="background:#f0fdf4">
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px">
+    {% for p in pairs if p.signal == 'execute' %}
+    <div style="background:#fff;border:1px solid #bbf7d0;border-radius:8px;padding:12px 14px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <span style="font-size:14px;font-weight:700;color:#0f172a">K1={{ "{:,}".format(p.k1|int) }} / K2={{ "{:,}".format(p.k2|int) }}</span>
+          <span style="font-size:11px;color:#64748b;margin-left:8px">Width: {{ p.box_w|int }}</span>
+        </div>
+        <span style="font-size:13px;font-weight:700;color:#16a34a">{{ pct(p.ann_ret) }} p.a.</span>
+      </div>
+      <div style="font-size:11px;color:#374151;line-height:1.8;font-family:'Courier New',monospace;background:#f8fafc;padding:8px 10px;border-radius:6px;margin-bottom:8px">
+        Buy  Call {{ "{:,}".format(p.k1|int) }} @ ₹{{ "%.2f"|format(p.ca1) }}&nbsp;&nbsp;Sell Call {{ "{:,}".format(p.k2|int) }} @ ₹{{ "%.2f"|format(p.cb2) }}<br>
+        Buy  Put  {{ "{:,}".format(p.k2|int) }} @ ₹{{ "%.2f"|format(p.pa2) }}&nbsp;&nbsp;Sell Put  {{ "{:,}".format(p.k1|int) }} @ ₹{{ "%.2f"|format(p.pb1) }}
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;font-size:11px">
+        <div style="text-align:center;background:#f0fdf4;border-radius:4px;padding:4px">
+          <div style="color:#64748b">Net P&L/lot</div>
+          <div style="font-weight:700;color:#16a34a;font-family:monospace">{{ inr(p.net_pnl) }}</div>
+        </div>
+        <div style="text-align:center;background:#eff6ff;border-radius:4px;padding:4px">
+          <div style="color:#64748b">Post-tax</div>
+          <div style="font-weight:700;color:#2563eb;font-family:monospace">{{ pct(p.post_tax_ann) }}</div>
+        </div>
+        <div style="text-align:center;background:#fefce8;border-radius:4px;padding:4px">
+          <div style="color:#64748b">Max lots</div>
+          <div style="font-weight:700;color:#854d0e;font-family:monospace">{{ p.lots_possible }}</div>
+        </div>
+      </div>
+      {% if p.lots_possible > 0 %}
+      <div style="margin-top:8px;font-size:11px;color:#374151;line-height:1.6">
+        <strong>Why executable:</strong>
+        Box settles at ₹{{ "{:,}".format(p.box_value|int) }}. You pay ₹{{ "{:,}".format(p.net_debit|int) }} net debit.
+        After all costs (Entry STT {{ inr(p.entry_stt) }} + Settl STT {{ inr(p.settl_stt) }} + other {{ inr(p.other_costs) }}),
+        net profit is {{ inr(p.net_pnl) }}/lot = {{ pct(p.ann_ret) }} annualised over {{ d.get('dte','?') }} days.
+        {% if p.ann_ret >= params.rfr %}Beats the {{ params.rfr }}% risk-free rate by {{ "%.2f"|format(p.ann_ret - params.rfr) }}%.{% endif %}
+        {% if p.spread_pct is not none %}Bid-ask spread {{ "%.2f"|format(p.spread_pct) }}% is below the {{ params.max_spread_pct }}% threshold.{% endif %}
+      </div>
+      <div style="margin-top:6px;font-size:11px">
+        <strong>Liquidity:</strong> {{ p.get('oi_flag','—') }}
+        {% if p.get('oi_note') %} — {{ p.get('oi_note') }}{% endif %}
+        {% if p.get('ic_flag') %}&nbsp;·&nbsp; Impact: {{ p.get('ic_flag') }}{% endif %}
+        {% if p.get('adj_net_pnl') is not none %}&nbsp;·&nbsp; Adj. P&L after impact: <strong style="color:{% if p.adj_net_pnl >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(p.adj_net_pnl) }}</strong>{% endif %}
+      </div>
+      {% if p.adj_total_pnl is not none %}
+      <div style="margin-top:6px;background:#dcfce7;border-radius:4px;padding:5px 8px;font-size:12px;font-weight:600;color:#15803d">
+        Deploy ₹{{ "{:,.0f}".format(capital) }} → {{ p.lots_possible }} lots → Total P&L: {{ inr(p.adj_total_pnl) }}
+      </div>
+      {% endif %}
+      {% endif %}
+    </div>
+    {% endfor %}
+    </div>
+    {% if bord > 0 %}
+    <div style="margin-top:12px;padding:10px 12px;background:#fefce8;border:1px solid #fde68a;border-radius:6px;font-size:12px;color:#854d0e">
+      <strong>⚠ {{ bord }} borderline pairs</strong> are profitable but either don't beat the {{ params.min_ann_ret }}% hurdle rate or have bid-ask spread > {{ params.max_spread_pct }}%.
+      Switch to the <a href="/?expiry={{ active }}&sig=borderline&tax={{ tax_rate }}&capital={{ capital|int }}" style="color:#854d0e;font-weight:700">Borderline filter</a> to review them — some may be worth executing if your hurdle rate is lower.
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% elif active and total > 0 %}
+<div class="sec" style="border-left:4px solid #e2e8f0">
+  <div class="sh sh-static">
+    <span style="color:#64748b">No executable spreads for {{ active }}</span>
+  </div>
+  <div class="sb">
+    <div style="font-size:12px;color:#374151;line-height:1.8">
+      <strong>{{ bord }} borderline pairs</strong> are profitable but below the {{ params.min_ann_ret }}% annualised hurdle. 
+      <strong>{{ loss }} pairs</strong> show net losses — most due to Settlement STT (0.125% × box value) wiping the edge.<br>
+      <strong>Try:</strong> switching to a longer-dated expiry (more time = more premium inefficiency to exploit), 
+      or lowering the Min Ann. Return threshold in Analysis Controls if your hurdle rate is lower than {{ params.min_ann_ret }}%.
+    </div>
+  </div>
+</div>
+{% endif %}
 
 <!-- COST MODEL BREAKDOWN for this expiry -->
 {% if d.get('dte') %}
