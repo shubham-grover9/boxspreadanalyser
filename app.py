@@ -159,7 +159,7 @@ def fetch_one(fyers, raw_expiry):
         opt = resp.get("data", {})
         cmp = opt.get("ltp")
         chain_dict = {}
-        for row in opt.get("optionChain", []):
+        for row in opt.get("optionsChain", []):
             k = row.get("strikePrice")
             if k is None: continue
             if k not in chain_dict:
@@ -585,6 +585,7 @@ def inject_state():
 
 
 
+
 @app.route("/livetest")
 def livetest():
     token = load_token()
@@ -593,21 +594,28 @@ def livetest():
     try:
         from fyers_apiv3 import fyersModel
         fyers = fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=token, log_path="")
-        # Try with empty timestamp first (nearest expiry)
-        r1 = fyers.optionchain(data={"symbol": "NSE:NIFTY50-INDEX", "strikecount": 5, "timestamp": ""})
-        return jsonify({
-            "status": r1.get("s"),
-            "message": r1.get("message"),
-            "data_keys": list(r1.get("data", {}).keys()),
-            "ltp": r1.get("data", {}).get("ltp"),
-            "expiry_count": len(r1.get("data", {}).get("expiryData", [])),
-            "chain_count": len(r1.get("data", {}).get("optionChain", [])),
-            "first_expiry": r1.get("data", {}).get("expiryData", [{}])[0] if r1.get("data", {}).get("expiryData") else None,
-            "first_chain_row": r1.get("data", {}).get("optionChain", [{}])[0] if r1.get("data", {}).get("optionChain") else None,
-            "raw_sample": str(r1)[:500],
-        })
+        results = {}
+        # Test 1: empty strikecount, empty timestamp
+        r1 = fyers.optionchain(data={"symbol": "NSE:NIFTY50-INDEX", "strikecount": "", "timestamp": ""})
+        results["test1_empty"] = {
+            "s": r1.get("s"), "chain_len": len(r1.get("data", {}).get("optionsChain", [])),
+            "ltp": r1.get("data", {}).get("ltp"), "keys": list(r1.get("data", {}).keys()),
+            "first_row": r1.get("data", {}).get("optionsChain", [None])[0]
+        }
+        # Test 2: strikecount 10 integer, specific near expiry timestamp
+        expiry_list = r1.get("data", {}).get("expiryData", [])
+        if expiry_list:
+            ts = expiry_list[0].get("expiry")
+            r2 = fyers.optionchain(data={"symbol": "NSE:NIFTY50-INDEX", "strikecount": 10, "timestamp": str(ts)})
+            results["test2_with_ts"] = {
+                "s": r2.get("s"), "chain_len": len(r2.get("data", {}).get("optionsChain", [])),
+                "ltp": r2.get("data", {}).get("ltp"),
+                "first_row": r2.get("data", {}).get("optionsChain", [None])[0]
+            }
+        return jsonify(results)
     except Exception as e:
         return jsonify({"exception": str(e)})
+
 
 @app.route("/debug")
 def debug():
