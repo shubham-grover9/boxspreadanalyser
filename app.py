@@ -584,6 +584,31 @@ def inject_state():
     return {"state_data": sd, "state": state}
 
 
+
+@app.route("/livetest")
+def livetest():
+    token = load_token()
+    if not token:
+        return jsonify({"error": "No token"})
+    try:
+        from fyers_apiv3 import fyersModel
+        fyers = fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=token, log_path="")
+        # Try with empty timestamp first (nearest expiry)
+        r1 = fyers.optionchain(data={"symbol": "NSE:NIFTY50-INDEX", "strikecount": 5, "timestamp": ""})
+        return jsonify({
+            "status": r1.get("s"),
+            "message": r1.get("message"),
+            "data_keys": list(r1.get("data", {}).keys()),
+            "ltp": r1.get("data", {}).get("ltp"),
+            "expiry_count": len(r1.get("data", {}).get("expiryData", [])),
+            "chain_count": len(r1.get("data", {}).get("optionChain", [])),
+            "first_expiry": r1.get("data", {}).get("expiryData", [{}])[0] if r1.get("data", {}).get("expiryData") else None,
+            "first_chain_row": r1.get("data", {}).get("optionChain", [{}])[0] if r1.get("data", {}).get("optionChain") else None,
+            "raw_sample": str(r1)[:500],
+        })
+    except Exception as e:
+        return jsonify({"exception": str(e)})
+
 @app.route("/debug")
 def debug():
     out = {"expiries": state["expiries"], "global_error": state["global_error"],
