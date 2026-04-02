@@ -147,6 +147,66 @@ def calc_pair(r1, r2, dte):
         "signal": sig,
     }
 
+def calc_impact_cost(depth_map, sym_ca, dir_ca, qty_ca, sym_cb, dir_cb, qty_cb,
+                     sym_pa, dir_pa, qty_pa, sym_pb, dir_pb, qty_pb):
+    """Walk the order book for each of 4 legs and compute total impact cost in ₹."""
+    def walk_book(sym, direction, qty_units):
+        """Walk bids (for sell) or asks (for buy) to find average fill price."""
+        d = depth_map.get(sym, {})
+        book = d.get("ask", []) if direction == "buy" else d.get("bids", [])
+        if not book:
+            return None, None
+        mid = None
+        bid1 = d.get("bids", [{}])[0].get("price") if d.get("bids") else None
+        ask1 = d.get("ask", [{}])[0].get("price") if d.get("ask") else None
+        if bid1 and ask1:
+            mid = (bid1 + ask1) / 2
+        remaining = qty_units
+        total_cost = 0
+        for level in book:
+            price = level.get("price", 0)
+            vol   = level.get("volume", 0)
+            fill  = min(vol, remaining)
+            total_cost += price * fill
+            remaining  -= fill
+            if remaining <= 0:
+                break
+        if remaining > 0:
+            return None, None  # Not enough liquidity
+        avg_price = total_cost / qty_units
+        return avg_price, mid
+
+    total_impact = 0
+    details = []
+    for sym, direction, qty in [(sym_ca,dir_ca,qty_ca),(sym_cb,dir_cb,qty_cb),
+                                  (sym_pa,dir_pa,qty_pa),(sym_pb,dir_pb,qty_pb)]:
+        avg, mid = walk_book(sym, direction, qty)
+        if avg is None or mid is None:
+            details.append(None)
+            continue
+        # Impact = difference between fill price and mid, × qty
+        impact = abs(avg - mid) * qty
+        total_impact += impact
+        details.append(round(impact, 2))
+
+    if not any(d is not None for d in details):
+        return {"total_impact": None, "impact_pct": None, "flag": "⚪ No depth data"}
+
+    none_count = sum(1 for d in details if d is None)
+    if none_count > 0:
+        flag = "🟡 Partial depth"
+    elif total_impact == 0:
+        flag = "🟢 Low impact"
+    elif total_impact < 500:
+        flag = "🟢 Low impact"
+    elif total_impact < 2000:
+        flag = "🟡 Moderate impact"
+    else:
+        flag = "🔴 High impact — arb may not execute at quoted prices"
+
+    return {"total_impact": round(total_impact, 0), "impact_pct": None, "flag": flag}
+
+
 def fetch_one(fyers, raw_expiry):
     try:
         resp = fyers.optionchain(data={
@@ -191,6 +251,37 @@ def fetch_one(fyers, raw_expiry):
                 r = calc_pair(chain[i], chain[j], dte)
                 if r: pairs.append(r)
         pairs.sort(key=lambda x: x["ann_ret"], reverse=True)
+        # Fetch depth for top 20 candidates only (rate limit friendly)
+        top_candidates = [p for p in pairs if p["signal"] in ("execute","borderline")][:20]
+        if top_candidates and fyers:
+            symbols_needed = set()
+            for p in top_candidates:
+                # Build Fyers option symbols for the 4 legs
+                exp_str = expiry_display(raw_expiry).upper().replace("-","")
+                symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k1'])}CE")
+                symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k2'])}CE")
+                symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k1'])}PE")
+                symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k2'])}PE")
+            try:
+                depth_resp = fyers.depth(data={"symbol": list(symbols_needed)[:20], "ohlcv_flag": 0})
+                depth_map = depth_resp.get("d", {}) if depth_resp.get("s") == "ok" else {}
+            except Exception:
+                depth_map = {}
+            # Add impact cost to top candidates
+            lots = PARAMS["lot_size"] * PARAMS["num_lots"]
+            for p in top_candidates:
+                exp_str = expiry_display(raw_expiry).upper().replace("-","")
+                ic = calc_impact_cost(
+                    depth_map,
+                    f"NSE:NIFTY{exp_str}{int(p['k1'])}CE", "buy",  lots,  # Buy Call K1
+                    f"NSE:NIFTY{exp_str}{int(p['k2'])}CE", "sell", lots,  # Sell Call K2
+                    f"NSE:NIFTY{exp_str}{int(p['k2'])}PE", "buy",  lots,  # Buy Put K2
+                    f"NSE:NIFTY{exp_str}{int(p['k1'])}PE", "sell", lots,  # Sell Put K1
+                )
+                p["impact_cost"]     = ic["total_impact"]
+                p["ic_pct"]          = ic["impact_pct"]
+                p["adj_net_pnl"]     = round(p["net_pnl"] - ic["total_impact"], 0) if ic["total_impact"] else None
+                p["ic_flag"]         = ic["flag"]
         return {"error": None, "chain": chain, "pairs": pairs, "cmp": cmp, "dte": dte}
     except Exception as e:
         return {"error": str(e), "chain": [], "pairs": [], "cmp": None, "dte": None}
@@ -267,14 +358,55 @@ def index():
     maxann  = max((p["ann_ret"]  for p in all_pairs), default=None)
     # Enrich pairs with post-tax return and capital analysis
     enriched = []
+    chain_by_k = {s["k"]: s for s in d.get("chain", [])}
     for p in pairs:
         lots_possible = int(capital // p["net_debit"]) if p["net_debit"] > 0 else 0
         total_pnl     = p["net_pnl"] * lots_possible if lots_possible > 0 else None
         post_tax_ann  = p["ann_ret"] * (1 - tax_rate / 100) if p["ann_ret"] is not None else None
+        adj_total_pnl = (p.get("adj_net_pnl", p["net_pnl"]) or p["net_pnl"]) * lots_possible if lots_possible > 0 else None
+
+        # OI liquidity: find bottleneck leg (min OI across 4 strikes)
+        s1 = chain_by_k.get(p["k1"], {})
+        s2 = chain_by_k.get(p["k2"], {})
+        coi1 = s1.get("coi"); poi1 = s1.get("poi")
+        coi2 = s2.get("coi"); poi2 = s2.get("poi")
+        # The 4 legs: Buy Call K1 (coi1), Sell Call K2 (coi2), Buy Put K2 (poi2), Sell Put K1 (poi1)
+        leg_ois = [x for x in [coi1, coi2, poi2, poi1] if x is not None and x > 0]
+        bottleneck_oi = min(leg_ois) if leg_ois else None  # contracts
+        # OI in ₹ value: contracts × lot_size × mid_price_of_bottleneck_leg
+        # Simpler: use contracts × lot_size as proxy (conservative)
+        oi_flag = "⚫ No OI data"
+        oi_pct  = None
+        oi_note = None
+        if bottleneck_oi and lots_possible > 0:
+            order_size_lots = lots_possible  # lots we want to trade
+            oi_in_lots = bottleneck_oi  # OI is already in contracts (each = 1 lot)
+            oi_pct = (order_size_lots / oi_in_lots * 100) if oi_in_lots > 0 else None
+            if oi_pct is not None:
+                if oi_pct < 1:
+                    oi_flag = "🟢 OK"
+                    oi_note = f"Your order is {oi_pct:.2f}% of bottleneck OI — minimal market impact"
+                elif oi_pct < 5:
+                    oi_flag = "🟡 Caution"
+                    oi_note = f"Your order is {oi_pct:.1f}% of bottleneck OI — may cause some price movement"
+                elif oi_pct < 15:
+                    oi_flag = "🔴 High Risk"
+                    oi_note = f"Your order is {oi_pct:.1f}% of OI — likely to move prices against you"
+                else:
+                    oi_flag = "⛔ Avoid"
+                    oi_note = f"Your order is {oi_pct:.1f}% of OI — will close the arb before you fill"
+        elif bottleneck_oi == 0:
+            oi_flag = "⛔ No liquidity"
+            oi_note = "OI is zero on at least one leg — cannot execute"
+
         enriched.append({**p,
             "lots_possible": lots_possible,
             "total_pnl":     round(total_pnl, 0) if total_pnl is not None else None,
+            "adj_total_pnl": round(adj_total_pnl, 0) if adj_total_pnl is not None else None,
             "post_tax_ann":  round(post_tax_ann, 2) if post_tax_ann is not None else None,
+            "oi_flag": oi_flag, "oi_pct": round(oi_pct, 2) if oi_pct else None,
+            "oi_note": oi_note,
+            "bottleneck_oi": bottleneck_oi,
         })
     return render_template_string(PAGE,
         expiries=state["expiries"], active=active,
@@ -291,6 +423,65 @@ def index():
         capital=capital,
         refresh_sec=REFRESH_SEC,
     )
+
+@app.route("/calc")
+def calc():
+    # Get inputs from query params or use defaults
+    try:
+        k1    = float(request.args.get("k1", 24000))
+        k2    = float(request.args.get("k2", 25000))
+        ca1   = float(request.args.get("ca1", 0))  # Call Ask K1
+        cb2   = float(request.args.get("cb2", 0))  # Call Bid K2
+        pa2   = float(request.args.get("pa2", 0))  # Put Ask K2
+        pb1   = float(request.args.get("pb1", 0))  # Put Bid K1
+        dte   = float(request.args.get("dte", 90))
+    except Exception:
+        k1,k2,ca1,cb2,pa2,pb1,dte = 24000,25000,0,0,0,0,90
+
+    p = PARAMS
+    lots     = p["lot_size"] * p["num_lots"]
+    box_w    = k2 - k1
+    box_val  = box_w * lots
+
+    # Step by step
+    net_debit_unit  = ca1 + pa2 - cb2 - pb1
+    net_debit_total = net_debit_unit * lots
+
+    sell_prem  = (cb2 + pb1) * lots
+    entry_stt  = (p["stt_entry_pct"] / 100) * sell_prem
+
+    settl_stt  = (p["stt_settl_pct"] / 100) * box_val
+
+    total_prem = (ca1 + pa2 + cb2 + pb1) * lots
+    txn_charge = (p["txn_pct"]  / 100) * total_prem
+    sebi_chg   = (p["sebi_pct"] / 100) * total_prem
+    brokerage  = 4 * p["broker_per_leg"]
+    gst        = (p["gst_pct"] / 100) * brokerage
+    buy_prem   = (ca1 + pa2) * lots
+    stamp      = (p["stamp_pct"] / 100) * buy_prem
+    slip       = 4 * p["slip_per_leg"] * lots
+
+    other_costs = txn_charge + sebi_chg + brokerage + gst + stamp + slip
+    total_cost  = net_debit_total + entry_stt + settl_stt + other_costs
+    net_pnl     = box_val - total_cost
+    ret_pct     = (net_pnl / net_debit_total * 100) if net_debit_total else 0
+    ann_ret     = (ret_pct * 365 / dte) if dte else 0
+
+    has_input = any([ca1, cb2, pa2, pb1])
+
+    return render_template_string(CALC_PAGE,
+        k1=k1, k2=k2, ca1=ca1, cb2=cb2, pa2=pa2, pb1=pb1, dte=dte,
+        lots=lots, box_w=box_w, box_val=box_val,
+        net_debit_unit=net_debit_unit, net_debit_total=net_debit_total,
+        sell_prem=sell_prem, entry_stt=entry_stt,
+        settl_stt=settl_stt,
+        total_prem=total_prem, txn_charge=txn_charge, sebi_chg=sebi_chg,
+        brokerage=brokerage, gst=gst, stamp=stamp, slip=slip,
+        other_costs=other_costs, total_cost=total_cost,
+        net_pnl=net_pnl, ret_pct=ret_pct, ann_ret=ann_ret,
+        params=p, has_input=has_input, inr=inr, pct=pct,
+    )
+
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
@@ -352,78 +543,108 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
 .cv{font-size:20px;font-weight:700;font-family:'Courier New',monospace}
 .g{color:#16a34a}.a{color:#d97706}.r{color:#dc2626}.b{color:#2563eb}
 .sec{background:#fff;border-radius:9px;box-shadow:0 1px 2px rgba(0,0,0,.06);margin-bottom:14px;overflow:hidden}
-.sh{padding:10px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:13px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
-.sb{padding:14px 16px}
-/* Assumptions grid */
+.sh{padding:10px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:13px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;cursor:pointer;user-select:none}
+.sh-static{cursor:default}
+.sb{padding:16px}
+.toggle-hint{font-size:11px;color:#94a3b8;font-weight:400}
+/* Strategy summary */
+.strategy-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:800px){.strategy-grid{grid-template-columns:1fr}}
+.signal-card{border-radius:8px;padding:14px;border-left:4px solid}
+.signal-card.exec{background:#f0fdf4;border-color:#16a34a}
+.signal-card.border{background:#fefce8;border-color:#d97706}
+.signal-card.avoid{background:#fef2f2;border-color:#dc2626}
+.signal-card.impact{background:#eff6ff;border-color:#3b82f6}
+.sc-title{font-weight:700;font-size:13px;margin-bottom:6px}
+.sc-rule{font-size:12px;color:#374151;line-height:1.7;font-family:'Courier New',monospace;background:rgba(0,0,0,.04);padding:6px 8px;border-radius:4px;margin-bottom:6px}
+.sc-note{font-size:11px;color:#64748b;line-height:1.5}
+.formula-chain{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:14px;margin-top:12px}
+.fc-title{font-size:11px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}
+.fc-steps{display:flex;flex-direction:column;gap:6px}
+.fc-step{display:flex;align-items:baseline;gap:8px}
+.fc-num{width:20px;height:20px;border-radius:50%;background:#0f172a;color:#fff;font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.fc-formula{font-family:'Courier New',monospace;font-size:11px;color:#374151}
+.fc-arrow{color:#94a3b8;font-size:11px;margin:0 4px}
+/* Assumptions */
 .agrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 @media(max-width:900px){.agrid{grid-template-columns:repeat(2,1fr)}}
 .acard{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px}
-.acard-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px}
-.aname{font-size:12px;font-weight:600;color:#0f172a}
+.acard.highlight{border-color:#3b82f6;background:#eff6ff}
+.acard-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:5px}
+.aname{font-size:12px;font-weight:700;color:#0f172a}
 .aval{font-size:14px;font-weight:700;font-family:'Courier New',monospace;color:#2563eb;white-space:nowrap;margin-left:8px}
-.adesc{font-size:11px;color:#64748b;line-height:1.5}
-.awhy{font-size:10px;color:#94a3b8;margin-top:3px;font-style:italic}
-/* Interactive controls */
+.atag{display:inline-block;font-size:9px;padding:1px 5px;border-radius:3px;font-weight:600;margin-bottom:4px}
+.atag-what{background:#e0e7ff;color:#3730a3}
+.atag-why{background:#fef3c7;color:#92400e}
+.atag-how{background:#dcfce7;color:#166534}
+.atext{font-size:11px;color:#374151;line-height:1.5;margin-bottom:3px}
+/* Controls */
 .ctrl-bar{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;padding:12px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0}
 .ctrl-group{display:flex;flex-direction:column;gap:4px}
 .ctrl-label{font-size:11px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
-.ctrl-input{padding:6px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;font-family:'Courier New',monospace;background:#fff;width:140px}
-.ctrl-btn{padding:7px 16px;background:#0f172a;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;align-self:flex-end}
-/* Filter tabs */
-.ftabs{display:flex;gap:6px;flex-wrap:wrap}
-.ft{padding:5px 14px;border-radius:6px;border:1px solid #e2e8f0;background:#fff;text-decoration:none;font-size:12px;color:#475569;font-weight:500}
-.ft:hover{border-color:#94a3b8}.ft.on{background:#0f172a;color:#fff;border-color:#0f172a}
-.ft.g-on{background:#16a34a;color:#fff;border-color:#16a34a}
-.ft.a-on{background:#d97706;color:#fff;border-color:#d97706}
-.ft.r-on{background:#dc2626;color:#fff;border-color:#dc2626}
-/* Tables */
+.ctrl-input{padding:6px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;font-family:'Courier New',monospace;background:#fff;width:160px}
+.ctrl-btn{padding:7px 18px;background:#0f172a;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;align-self:flex-end}
+/* Calc breakdown */
+.calc-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
+@media(max-width:900px){.calc-grid{grid-template-columns:repeat(2,1fr)}}
+.calc-item{background:#f8fafc;border-radius:6px;padding:8px 10px;border-left:3px solid #e2e8f0}
+.calc-item.debit{border-color:#3b82f6}
+.calc-item.cost{border-color:#f59e0b}
+.calc-item.pnl{border-color:#16a34a}
+.calc-item.risk{border-color:#ef4444}
+.ci-label{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.4px;margin-bottom:3px}
+.ci-val{font-size:14px;font-weight:700;font-family:'Courier New',monospace}
+.ci-formula{font-size:10px;color:#94a3b8;margin-top:2px;font-family:'Courier New',monospace}
+/* Table */
 .tw{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:11.5px}
 th{background:#f1f5f9;padding:7px 10px;text-align:right;font-size:10px;color:#475569;font-weight:700;border-bottom:2px solid #e2e8f0;white-space:nowrap;text-transform:uppercase;letter-spacing:.3px}
 th.l{text-align:left}
+th.group-a{background:#eff6ff;color:#1d4ed8}
+th.group-b{background:#fefce8;color:#854d0e}
+th.group-c{background:#f0fdf4;color:#166534}
+th.group-d{background:#fef2f2;color:#991b1b}
+th.group-e{background:#f5f3ff;color:#5b21b6}
 td{padding:6px 10px;border-bottom:1px solid #f1f5f9;text-align:right;font-family:'Courier New',monospace;white-space:nowrap}
 td.l{text-align:left;font-family:inherit;font-weight:600}
 tr:hover td{background:#f8fafc}
 .pill{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:700;font-family:inherit}
 .pg{background:#dcfce7;color:#15803d}.pa{background:#fef3c7;color:#92400e}
 .pr{background:#fee2e2;color:#b91c1c}.ps{background:#f1f5f9;color:#64748b}
+.pb{background:#dbeafe;color:#1e40af}
 .empty{text-align:center;padding:40px;color:#94a3b8;font-size:13px}
 .na{color:#cbd5e1}
-.cap-hi{background:#f0fdf4;color:#15803d;font-weight:700}
-.cap-med{background:#fefce8;color:#854d0e}
-.cap-lo{background:#fff7ed;color:#c2410c}
 </style>
+<script>
+function toggle(id){var el=document.getElementById(id);el.style.display=el.style.display==='none'?'':'none';}
+</script>
 </head>
 <body>
 <div class="topbar">
   <div>
     <div class="t1">NIFTY Box Spread Arbitrage Scanner</div>
     <div class="t2">
-      {% if active %}{{ active }} &nbsp;·&nbsp; DTE: {{ d.get('dte','?') }} &nbsp;·&nbsp; CMP: ₹{{ "{:,.0f}".format(d.get('cmp',0) or 0) }} &nbsp;·&nbsp; Lot: {{ params.lot_size }}{% else %}Waiting for data...{% endif %}
+      {% if active %}{{ active }} &nbsp;·&nbsp; DTE: {{ d.get('dte','?') }} &nbsp;·&nbsp; CMP: ₹{{ "{:,.0f}".format(d.get('cmp',0) or 0) }} &nbsp;·&nbsp; Lot: {{ params.lot_size }} &nbsp;·&nbsp; Capital: ₹{{ "{:,.0f}".format(capital) }} &nbsp;·&nbsp; Tax: {{ tax_rate|int }}%{% endif %}
     </div>
   </div>
-  <div class="live">
-    <div class="dot"></div>
+  <div class="live"><div class="dot"></div>
     {% if not authenticated %}Not authenticated — <a href="/admin" style="color:#60a5fa">login</a>
     {% elif global_error %}<span style="color:#f87171">{{ global_error }}</span>
-    {% else %}Live &nbsp;·&nbsp; Updated {{ last_fetch or '...' }} &nbsp;·&nbsp; Auto-refreshes every {{ refresh_sec }}s{% endif %}
+    {% else %}Live · Updated {{ last_fetch or '...' }} · Auto-refreshes every {{ refresh_sec }}s{% endif %}
   </div>
 </div>
-
 <div class="main">
 {% if global_error %}<div class="err">{{ global_error }}</div>{% endif %}
 
 <!-- EXPIRY TABS -->
 <div class="ebar">
   <span class="elabel">Expiry</span>
-  {% if expiries %}
-    {% for e in expiries %}
-      {% set en = state_data.get(e, {}).get('arb_count', 0) %}
-      <a href="/?expiry={{ e }}&sig={{ sig_filter }}&tax={{ tax_rate }}&capital={{ capital|int }}" class="eb {% if e == active %}on{% endif %}">
-        {{ e }}{% if en > 0 %}<span class="arbn">{{ en }}</span>{% endif %}
-      </a>
-    {% endfor %}
-  {% else %}
+  {% if expiries %}{% for e in expiries %}
+    {% set en = state_data.get(e, {}).get('arb_count', 0) %}
+    <a href="/?expiry={{ e }}&sig={{ sig_filter }}&tax={{ tax_rate }}&capital={{ capital|int }}" class="eb{% if e==active %} on{% endif %}">
+      {{ e }}{% if en > 0 %}<span class="arbn">{{ en }}</span>{% endif %}
+    </a>
+  {% endfor %}{% else %}
     <span style="font-size:12px;color:#94a3b8">{% if authenticated %}Loading...{% else %}Login at <a href="/admin">/admin</a>{% endif %}</span>
   {% endif %}
 </div>
@@ -431,142 +652,272 @@ tr:hover td{background:#f8fafc}
 <!-- SCORECARD -->
 <div class="cards">
   <div class="card"><div class="cl">Complete Pairs</div><div class="cv b">{{ total }}</div></div>
-  <div class="card"><div class="cl">Arbitrage ✔</div><div class="cv g">{{ arb }}</div></div>
-  <div class="card"><div class="cl">Borderline ⚠</div><div class="cv a">{{ bord }}</div></div>
-  <div class="card"><div class="cl">Loss ✘</div><div class="cv r">{{ loss }}</div></div>
+  <div class="card"><div class="cl">✅ Execute</div><div class="cv g">{{ arb }}</div></div>
+  <div class="card"><div class="cl">⚠ Borderline</div><div class="cv a">{{ bord }}</div></div>
+  <div class="card"><div class="cl">❌ Loss</div><div class="cv r">{{ loss }}</div></div>
   <div class="card"><div class="cl">Best P&L/lot</div><div class="cv g" style="font-size:14px">{{ inr(best) }}</div></div>
   <div class="card"><div class="cl">Max Ann. Return</div><div class="cv g" style="font-size:14px">{{ pct(maxann) }}</div></div>
 </div>
 
-<!-- ASSUMPTIONS -->
+<!-- STRATEGY SUMMARY -->
 <div class="sec">
-  <div class="sh">
-    <span>Assumptions</span>
-    <span style="font-size:11px;color:#94a3b8">These are the inputs that drive every calculation below — hover each card to understand its role</span>
+  <div class="sh sh-static" onclick="toggle('summary-body')">
+    <span>How this scanner works — Signal logic, cost model &amp; impact cost explained</span>
+    <span class="toggle-hint">click to expand/collapse</span>
   </div>
+  <div id="summary-body" style="display:none">
   <div class="sb">
-    <div class="agrid">
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Lot Size (NIFTY)</span><span class="aval">{{ params.lot_size }} units</span></div>
-        <div class="adesc">Number of NIFTY units in one futures/options lot. NSE sets this — currently 75 for weekly, 65 for monthly.</div>
-        <div class="awhy">Why it matters: All P&L is multiplied by lot size. A ₹100/unit profit on 65 units = ₹6,500.</div>
+    <div class="strategy-grid">
+      <div>
+        <p style="font-size:13px;line-height:1.7;color:#374151;margin-bottom:12px">
+          A <strong>Long Box Spread</strong> is a 4-leg options strategy: Buy Call(K1) + Sell Call(K2) + Buy Put(K2) + Sell Put(K1).
+          At expiry, it always settles at exactly <strong>K2 − K1</strong> regardless of where NIFTY is. It is fully direction-neutral.
+          Arbitrage exists when you can buy the box cheaper than it will settle for.
+        </p>
+        <div class="formula-chain">
+          <div class="fc-title">Profit Condition</div>
+          <div class="fc-steps">
+            <div class="fc-step"><span class="fc-num">1</span><span class="fc-formula">Box Value = (K2 − K1) × Lot Size &nbsp;→ always received at expiry</span></div>
+            <div class="fc-step"><span class="fc-num">2</span><span class="fc-formula">Net Debit = Call Ask(K1) + Put Ask(K2) − Call Bid(K2) − Put Bid(K1)</span></div>
+            <div class="fc-step"><span class="fc-num">3</span><span class="fc-formula">Gross Profit = Box Value − Net Debit &nbsp;(before costs)</span></div>
+            <div class="fc-step"><span class="fc-num">4</span><span class="fc-formula">All Costs = Entry STT + Settlement STT + Brokerage + GST + NSE Txn + SEBI + Stamp + Slippage + Impact Cost</span></div>
+            <div class="fc-step"><span class="fc-num">5</span><span class="fc-formula">Net P&L = Box Value − Net Debit − All Costs</span></div>
+            <div class="fc-step"><span class="fc-num">6</span><span class="fc-formula">Ann. Return = (Net P&L / Net Debit) × (365 / DTE) × 100</span></div>
+          </div>
+        </div>
       </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Number of Lots</span><span class="aval">{{ params.num_lots }}</span></div>
-        <div class="adesc">How many lots you trade per box spread. Change this to scale up or down your position.</div>
-        <div class="awhy">Why it matters: All costs and P&L scale linearly with lots. 2 lots = 2× P&L and 2× capital deployed.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Brokerage per Leg</span><span class="aval">₹{{ params.broker_per_leg }}</span></div>
-        <div class="adesc">Flat fee charged per order leg. A box spread has 4 legs (2 calls + 2 puts), so total brokerage = 4 × ₹20 = ₹80.</div>
-        <div class="awhy">Why it matters: Fixed cost regardless of trade size. For small capital boxes, this can wipe the arb edge.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">GST on Brokerage</span><span class="aval">{{ params.gst_pct }}%</span></div>
-        <div class="adesc">18% GST applied only on the brokerage component, not on premiums. Mandatory government tax.</div>
-        <div class="awhy">Why it matters: Adds ₹14.40 to the ₹80 brokerage = ₹94.40 fixed cost floor per box.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Entry STT (sell legs)</span><span class="aval">{{ params.stt_entry_pct }}%</span></div>
-        <div class="adesc">Securities Transaction Tax on sell-side option premiums at entry. Charged on Sell Call(K2) + Sell Put(K1) premiums.</div>
-        <div class="awhy">Why it matters: Deep ITM sell legs carry large premiums → large STT. Often the #1 cost killer for wide boxes.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Settlement STT</span><span class="aval">{{ params.stt_settl_pct }}%</span></div>
-        <div class="adesc">0.125% STT charged on the intrinsic value at expiry settlement. This is ALWAYS charged when holding to expiry.</div>
-        <div class="awhy">Why it matters: This is the critical cost unique to box spreads held to expiry. On a ₹1,000 wide box: ₹81.25 per lot in settlement STT alone.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">NSE Txn Charge</span><span class="aval">{{ params.txn_pct }}%</span></div>
-        <div class="adesc">NSE exchange transaction charge: ₹3,503 per crore of premium turnover (0.03503%). Applied on total premium of all 4 legs.</div>
-        <div class="awhy">Why it matters: Proportional to premium size. High-premium deep-ITM boxes pay more here.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">SEBI Charge</span><span class="aval">{{ params.sebi_pct }}%</span></div>
-        <div class="adesc">SEBI regulatory fee: ₹10 per crore of premium turnover (0.0001%). Very small but legally mandatory.</div>
-        <div class="awhy">Why it matters: Negligible in absolute terms but included for precision — every paisa counts in arb.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Stamp Duty (buy side)</span><span class="aval">{{ params.stamp_pct }}%</span></div>
-        <div class="adesc">State stamp duty charged only on buy-side premiums — Buy Call(K1) Ask + Buy Put(K2) Ask.</div>
-        <div class="awhy">Why it matters: Only on buy legs, so buying deep-ITM calls (high premium) increases this cost.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Slippage per Leg</span><span class="aval">{{ params.slip_per_leg }} pts</span></div>
-        <div class="adesc">Assumed execution slippage (0.5 index points per leg) — conservative estimate for getting filled at the quoted price.</div>
-        <div class="awhy">Why it matters: Wide bid-ask spreads in illiquid strikes mean you may not get the quoted price. 4 legs × 0.5 pts = 2 pts total.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Risk-Free Rate</span><span class="aval">{{ params.rfr }}%</span></div>
-        <div class="adesc">Current 91-day T-bill / RBI repo rate benchmark. Used to measure if the box spread return beats simply putting money in a FD.</div>
-        <div class="awhy">Why it matters: A box spread returning 6.4% when the RFR is 6.5% is NOT an arbitrage — you'd earn more in a FD.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Min Ann. Return Threshold</span><span class="aval">{{ params.min_ann_ret }}%</span></div>
-        <div class="adesc">Minimum annualized return required to flag a pair as EXECUTE (not just borderline). Set above the RFR.</div>
-        <div class="awhy">Why it matters: Filters out pairs that technically profit but don't beat a simple FD after all friction costs.</div>
-      </div>
-      <div class="acard">
-        <div class="acard-top"><span class="aname">Max Bid-Ask Spread %</span><span class="aval">{{ params.max_spread_pct }}%</span></div>
-        <div class="adesc">Maximum allowable bid-ask spread (as % of box width) across all 4 legs. Measures execution risk.</div>
-        <div class="awhy">Why it matters: Wide spreads mean the theoretical price may not be the fill price. High spread = arb may evaporate on execution.</div>
-      </div>
-      <div class="acard" style="border-color:#3b82f6;background:#eff6ff">
-        <div class="acard-top"><span class="aname">Fixed Cost/Box (excl STT)</span><span class="aval" style="color:#1d4ed8">₹{{ "%.2f"|format(4 * params.broker_per_leg * (1 + params.gst_pct/100)) }}</span></div>
-        <div class="adesc">The minimum unavoidable fixed cost per box spread: brokerage (₹80) + GST (₹14.40). This is your floor cost before variable charges.</div>
-        <div class="awhy">Why it matters: Any pair where box value − net debit &lt; ₹94.40 is a guaranteed loss regardless of premiums.</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div class="signal-card exec">
+          <div class="sc-title">✅ EXECUTE</div>
+          <div class="sc-rule">Net P&L > 0 AND Ann. Return ≥ {{ params.min_ann_ret }}% AND Spread% &lt; {{ params.max_spread_pct }}%</div>
+          <div class="sc-note">All 3 conditions must be met. Annualized return must beat the minimum threshold (set above the {{ params.rfr }}% risk-free rate). Bid-ask spread must be tight enough that execution is feasible at quoted prices.</div>
+        </div>
+        <div class="signal-card border">
+          <div class="sc-title">⚠ BORDERLINE</div>
+          <div class="sc-rule">Net P&L > 0 BUT Ann. Return &lt; {{ params.min_ann_ret }}% OR Spread% ≥ {{ params.max_spread_pct }}%</div>
+          <div class="sc-note">Profitable on paper but either doesn't beat the hurdle rate, or the bid-ask spread risk is too high. Worth monitoring — may become Execute if prices shift slightly.</div>
+        </div>
+        <div class="signal-card avoid">
+          <div class="sc-title">❌ AVOID</div>
+          <div class="sc-rule">Net P&L ≤ 0 after ALL costs including settlement STT</div>
+          <div class="sc-note">The most common reason is Settlement STT (0.125% of box value) which is always charged. Deep ITM boxes with high Entry STT on sell legs are also frequent losers.</div>
+        </div>
+        <div class="signal-card impact">
+          <div class="sc-title">📊 Impact Cost Layer (on top of Signal)</div>
+          <div class="sc-rule">🟢 OK: &lt;1% of OI &nbsp; 🟡 Caution: 1–5% &nbsp; 🔴 High Risk: 5–15% &nbsp; ⛔ Avoid: &gt;15%</div>
+          <div class="sc-note">Even a valid Execute signal may be unfeasible if your capital is large relative to the open interest on the weakest leg. A 🔴 flag means your own order will move the market against you before you finish filling.</div>
+        </div>
       </div>
     </div>
   </div>
+  </div>
 </div>
 
-<!-- INTERACTIVE CONTROLS -->
+<!-- CONTROLS -->
 <div class="sec">
-  <div class="sh">Analysis Controls</div>
+  <div class="sh sh-static">Analysis Controls</div>
   <form method="GET" action="/">
     <input type="hidden" name="expiry" value="{{ active or '' }}">
     <div class="ctrl-bar">
       <div class="ctrl-group">
         <label class="ctrl-label">Income Tax Bracket</label>
-        <select name="tax" class="ctrl-input" style="width:160px">
-          {% for t in [0, 5, 10, 15, 20, 25, 30] %}
-          <option value="{{ t }}" {% if tax_rate == t %}selected{% endif %}>{{ t }}% — {% if t==0 %}No tax (exempt){% elif t==5 %}Up to ₹3L income{% elif t==10 %}Up to ₹6L income{% elif t==15 %}Up to ₹9L income{% elif t==20 %}Up to ₹12L income{% elif t==25 %}Up to ₹15L income{% else %}Above ₹15L income{% endif %}</option>
+        <select name="tax" class="ctrl-input" style="width:200px">
+          {% for t,lbl in [(0,'No tax (exempt)'),(5,'Up to ₹3L income'),(10,'Up to ₹6L income'),(15,'Up to ₹9L income'),(20,'Up to ₹12L income'),(25,'Up to ₹15L income'),(30,'Above ₹15L income')] %}
+          <option value="{{ t }}" {% if tax_rate==t %}selected{% endif %}>{{ t }}% — {{ lbl }}</option>
           {% endfor %}
         </select>
-        <span style="font-size:10px;color:#94a3b8;margin-top:2px">Box spread gains = STCG, taxed at your slab rate</span>
+        <span style="font-size:10px;color:#94a3b8">Box spread gains = STCG, taxed at slab</span>
       </div>
       <div class="ctrl-group">
         <label class="ctrl-label">Deployable Capital (₹)</label>
-        <input type="number" name="capital" class="ctrl-input" value="{{ capital|int }}" step="10000" style="width:180px">
-        <span style="font-size:10px;color:#94a3b8;margin-top:2px">How much capital you want to allocate</span>
+        <input type="number" name="capital" class="ctrl-input" value="{{ capital|int }}" step="50000" style="width:180px">
+        <span style="font-size:10px;color:#94a3b8">Used for lot sizing &amp; OI liquidity check</span>
       </div>
       <div class="ctrl-group">
         <label class="ctrl-label">Signal Filter</label>
-        <select name="sig" class="ctrl-input" style="width:180px">
+        <select name="sig" class="ctrl-input" style="width:200px">
           <option value="all" {% if sig_filter=='all' %}selected{% endif %}>All pairs ({{ total }})</option>
-          <option value="execute" {% if sig_filter=='execute' %}selected{% endif %}>✔ Execute only ({{ arb }})</option>
+          <option value="execute" {% if sig_filter=='execute' %}selected{% endif %}>✅ Execute only ({{ arb }})</option>
           <option value="borderline" {% if sig_filter=='borderline' %}selected{% endif %}>⚠ Borderline ({{ bord }})</option>
-          <option value="loss" {% if sig_filter=='loss' %}selected{% endif %}>✘ Loss — avoid ({{ loss }})</option>
+          <option value="loss" {% if sig_filter=='loss' %}selected{% endif %}>❌ Loss — avoid ({{ loss }})</option>
         </select>
       </div>
       <button type="submit" class="ctrl-btn">Apply →</button>
+      <div style="margin-left:auto;font-size:11px;color:#94a3b8;align-self:flex-end;text-align:right">
+        <a href="/calc" style="color:#3b82f6">Step-by-step calculator →</a>
+      </div>
     </div>
   </form>
+</div>
+
+<!-- COST MODEL BREAKDOWN for this expiry -->
+{% if d.get('dte') %}
+<div class="sec">
+  <div class="sh" onclick="toggle('calcbody')">
+    <span>Cost Model Breakdown — how each cost is calculated for {{ active }}</span>
+    <span class="toggle-hint">click to expand/collapse</span>
+  </div>
+  <div id="calcbody" style="display:none"><div class="sb">
+    <p style="font-size:12px;color:#64748b;margin-bottom:12px">These are the costs applied to every pair in the table below. Variable costs (STT, txn, SEBI, stamp) scale with premium; fixed costs (brokerage, GST) are the same for every pair.</p>
+    <div class="calc-grid">
+      <div class="calc-item debit">
+        <div class="ci-label">Net Debit (capital deployed)</div>
+        <div class="ci-val" style="color:#2563eb">Variable per pair</div>
+        <div class="ci-formula">= C_Ask(K1) + P_Ask(K2) − C_Bid(K2) − P_Bid(K1)</div>
+        <div class="ci-formula" style="margin-top:3px">× {{ params.lot_size }} units (lot size)</div>
+      </div>
+      <div class="calc-item debit">
+        <div class="ci-label">Box Value (settlement)</div>
+        <div class="ci-val" style="color:#2563eb">Variable per pair</div>
+        <div class="ci-formula">= (K2 − K1) × {{ params.lot_size }} units</div>
+        <div class="ci-formula" style="margin-top:3px">Always received at expiry</div>
+      </div>
+      <div class="calc-item cost">
+        <div class="ci-label">Entry STT (sell legs)</div>
+        <div class="ci-val" style="color:#d97706">{{ params.stt_entry_pct }}% of sell premium</div>
+        <div class="ci-formula">= {{ params.stt_entry_pct }}% × (C_Bid(K2) + P_Bid(K1)) × {{ params.lot_size }}</div>
+        <div class="ci-formula" style="margin-top:3px">Charged by NSE at entry on sell side</div>
+      </div>
+      <div class="calc-item cost">
+        <div class="ci-label">Settlement STT ⚠</div>
+        <div class="ci-val" style="color:#d97706">{{ params.stt_settl_pct }}% of box value</div>
+        <div class="ci-formula">= {{ params.stt_settl_pct }}% × (K2−K1) × {{ params.lot_size }}</div>
+        <div class="ci-formula" style="margin-top:3px">Always charged at expiry — unavoidable</div>
+      </div>
+      <div class="calc-item cost">
+        <div class="ci-label">Brokerage + GST</div>
+        <div class="ci-val" style="color:#d97706">₹{{ "%.2f"|format(4 * params.broker_per_leg * (1 + params.gst_pct/100)) }}</div>
+        <div class="ci-formula">= 4 legs × ₹{{ params.broker_per_leg }} × (1 + {{ params.gst_pct }}%)</div>
+        <div class="ci-formula" style="margin-top:3px">Fixed floor — same for every pair</div>
+      </div>
+      <div class="calc-item cost">
+        <div class="ci-label">NSE Txn + SEBI</div>
+        <div class="ci-val" style="color:#d97706">{{ params.txn_pct }}% + {{ params.sebi_pct }}%</div>
+        <div class="ci-formula">= ({{ params.txn_pct }}% + {{ params.sebi_pct }}%) × total 4-leg premium</div>
+        <div class="ci-formula" style="margin-top:3px">Scales with premium value of all 4 legs</div>
+      </div>
+      <div class="calc-item cost">
+        <div class="ci-label">Stamp Duty + Slippage</div>
+        <div class="ci-val" style="color:#d97706">Variable</div>
+        <div class="ci-formula">Stamp: {{ params.stamp_pct }}% × buy-side premium</div>
+        <div class="ci-formula" style="margin-top:3px">Slip: 4 × {{ params.slip_per_leg }}pts × {{ params.lot_size }} = ₹{{ 4 * params.slip_per_leg * params.lot_size }}</div>
+      </div>
+      <div class="calc-item risk">
+        <div class="ci-label">Impact Cost (top 20 pairs)</div>
+        <div class="ci-val" style="color:#dc2626">Order-book based</div>
+        <div class="ci-formula">Walks 5-level depth for all 4 legs</div>
+        <div class="ci-formula" style="margin-top:3px">Mid vs avg fill price × your lot size</div>
+      </div>
+    </div>
+    <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:6px;padding:10px 12px;font-size:11px;color:#78350f;margin-top:4px">
+      <strong>Why Settlement STT is the key cost:</strong> On a K2−K1=1000 wide box with lot size {{ params.lot_size }}:
+      Settlement STT = {{ params.stt_settl_pct }}% × ₹{{ 1000 * params.lot_size | int }} = ₹{{ (params.stt_settl_pct/100 * 1000 * params.lot_size) | round(2) }} per lot.
+      This alone means the box must trade at a discount of more than ₹{{ (params.stt_settl_pct/100 * 1000 * params.lot_size) | round(0) | int }} to be profitable — which is why most pairs show losses.
+    </div>
+  </div></div>
+</div>
+{% endif %}
+
+<!-- ASSUMPTIONS -->
+<div class="sec">
+  <div class="sh" onclick="toggle('assump-body')">
+    <span>Assumptions — what each input is, why it matters, and how it's used</span>
+    <span class="toggle-hint">click to expand/collapse</span>
+  </div>
+  <div id="assump-body" style="display:none"><div class="sb">
+    <div class="agrid">
+      {% set assumptions = [
+        ("Lot Size (NIFTY)", params.lot_size|string ~ " units", False,
+         "Number of NIFTY units in one options lot. NSE-mandated — currently 65 for monthly expiry contracts.",
+         "Every P&L calculation multiplies by lot size. A ₹10/unit edge × 65 = ₹650/lot.",
+         "Used in: Net Debit, Box Value, Entry STT, Settlement STT, Stamp Duty, Slippage — literally every formula."),
+        ("Number of Lots", params.num_lots|string, False,
+         "How many lots you trade per box spread. Set to 1 here; increase to scale position size.",
+         "All costs and P&L multiply linearly. 2 lots = 2× capital, 2× P&L, 2× exposure.",
+         "Scales Net Debit, Box Value, and all variable costs. Also drives the OI liquidity check."),
+        ("Brokerage per Leg", "₹" ~ params.broker_per_leg|string, False,
+         "Flat fee charged per order leg by your broker (Fyers). A box spread has exactly 4 legs.",
+         "₹80 total brokerage is the fixed floor cost that must be recovered before any profit.",
+         "Used in: Fixed Cost = 4 × ₹20 = ₹80, then GST applied on top → ₹94.40 minimum cost."),
+        ("GST on Brokerage", params.gst_pct|string ~ "%", False,
+         "18% GST charged by the government on brokerage fees only — not on premiums or STT.",
+         "Adds ₹14.40 to the ₹80 brokerage. Combined ₹94.40 is the fixed cost floor for every box.",
+         "Used in: Other Costs = brokerage × (1 + 18%). Applied before P&L is computed."),
+        ("Entry STT (sell legs)", params.stt_entry_pct|string ~ "%", False,
+         "Securities Transaction Tax charged at 0.05% on the premium of sell legs at entry: Sell Call(K2) + Sell Put(K1).",
+         "Deep ITM sell legs carry high premiums → high STT. Often the #1 cost killer for wide boxes.",
+         "Used in: Entry STT = 0.05% × (Call_Bid(K2) + Put_Bid(K1)) × Lot Size. Deducted from gross profit."),
+        ("Settlement STT", params.stt_settl_pct|string ~ "%", False,
+         "0.125% STT charged on the intrinsic value at expiry settlement. Always charged when holding to expiry — no way to avoid it.",
+         "On a ₹1,000 wide box: ₹81.25 per lot in settlement STT alone. This is why most boxes show losses.",
+         "Used in: Settlement STT = 0.125% × (K2−K1) × Lot Size. This is the critical cost unique to box spreads."),
+        ("NSE Txn Charge", params.txn_pct|string ~ "%", False,
+         "NSE exchange fee: ₹3,503 per crore of total premium turnover (0.03503%). Applied on all 4 legs combined.",
+         "Scales with total premium. Deep ITM boxes have high total premium → higher NSE charges.",
+         "Used in: NSE Txn = 0.03503% × (C_Ask(K1) + C_Bid(K2) + P_Ask(K2) + P_Bid(K1)) × Lot Size."),
+        ("SEBI Charge", params.sebi_pct|string ~ "%", False,
+         "SEBI regulatory fee: ₹10 per crore of premium turnover (0.0001%). Mandatory but negligible.",
+         "Very small in absolute terms but included for completeness — every paisa matters in arbitrage.",
+         "Used in: SEBI = 0.0001% × total 4-leg premium × Lot Size. Same base as NSE Txn."),
+        ("Stamp Duty", params.stamp_pct|string ~ "%", False,
+         "State government stamp duty charged only on buy-side premiums: Buy Call(K1) Ask + Buy Put(K2) Ask.",
+         "Only on buy legs. Buying deep ITM calls (high premium) increases this cost.",
+         "Used in: Stamp = 0.003% × (C_Ask(K1) + P_Ask(K2)) × Lot Size."),
+        ("Slippage per Leg", params.slip_per_leg|string ~ " pts", False,
+         "Conservative flat slippage assumption: 0.5 index points per leg. Accounts for not always getting the quoted mid price.",
+         "4 legs × 0.5 pts × 65 = ₹130 slippage per box. For illiquid strikes this may be a large underestimate.",
+         "Used in: Slippage = 4 × 0.5 × Lot Size = ₹130. Deducted from Net P&L in Other Costs."),
+        ("Risk-Free Rate", params.rfr|string ~ "%", False,
+         "Current 91-day T-bill / RBI repo rate. The benchmark you compare box spread returns against.",
+         "A box returning 6.4% when FDs give 6.5% is NOT an arbitrage — you'd do better in a bank.",
+         "Used in: Ann. Return vs RFR comparison. Green if Ann% > RFR, amber if lower. Sets the hurdle."),
+        ("Min Ann. Return", params.min_ann_ret|string ~ "%", False,
+         "Minimum annualized return for EXECUTE signal. Set above the RFR to ensure true outperformance.",
+         "Filters borderline pairs that technically profit but don't beat a simple fixed deposit.",
+         "Used in: Signal = EXECUTE if Ann% ≥ Min Ann% AND spread < Max Spread%. Otherwise BORDERLINE."),
+        ("Max Bid-Ask Spread %", params.max_spread_pct|string ~ "%", False,
+         "Maximum allowable bid-ask spread (total across 4 legs, as % of box width). Measures execution feasibility.",
+         "Wide spreads mean the theoretical arb may vanish when you try to execute at real market prices.",
+         "Used in: Signal = EXECUTE only if Spread% < 1%. Spread% = sum of 4 leg spreads ÷ box width."),
+        ("Fixed Cost Floor", "₹" ~ (4 * params.broker_per_leg * (1 + params.gst_pct/100))|round(2)|string, True,
+         "The minimum unavoidable fixed cost per box: 4 × ₹20 brokerage + 18% GST = ₹94.40.",
+         "Any pair where (Box Value − Net Debit) < ₹94.40 is a guaranteed loss before STT or any other cost.",
+         "Used in: Breakeven check. Gross profit must exceed ₹94.40 just to cover fixed costs alone."),
+      ] %}
+      {% for name, val, hl, what, why, how in assumptions %}
+      <div class="acard{% if hl %} highlight{% endif %}">
+        <div class="acard-top"><span class="aname">{{ name }}</span><span class="aval">{{ val }}</span></div>
+        <div style="margin-bottom:5px">
+          <span class="atag atag-what">WHAT</span>
+          <span class="atext">{{ what }}</span>
+        </div>
+        <div style="margin-bottom:5px">
+          <span class="atag atag-why">WHY</span>
+          <span class="atext">{{ why }}</span>
+        </div>
+        <div>
+          <span class="atag atag-how">HOW USED</span>
+          <span class="atext">{{ how }}</span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div></div>
 </div>
 
 <!-- OPTION CHAIN -->
 {% if chain %}
 <div class="sec">
-  <div class="sh">
-    <span>Option Chain — {{ active }} ({{ chain|length }} strikes)</span>
-    <span style="font-size:11px;color:#94a3b8">Buy at Ask · Sell at Bid · Mid = theoretical fair value</span>
+  <div class="sh" onclick="toggle('chain-body')">
+    <span>Option Chain — {{ active }} ({{ chain|length }} strikes) &nbsp;·&nbsp; Buy at Ask · Sell at Bid</span>
+    <span class="toggle-hint">click to expand/collapse</span>
   </div>
-  <div class="tw">
+  <div id="chain-body"><div class="tw">
     <table>
       <thead><tr>
         <th class="l">Strike (K)</th>
-        <th>Call Bid</th><th>Call Ask</th><th>Call Mid</th><th>Call IV%</th><th>Call OI</th>
-        <th>Put Bid</th><th>Put Ask</th><th>Put Mid</th><th>Put IV%</th><th>Put OI</th>
+        <th class="group-a">Call Bid</th><th class="group-a">Call Ask</th><th class="group-a">Call Mid</th><th class="group-a">Call IV%</th><th class="group-a">Call OI</th>
+        <th class="group-b">Put Bid</th><th class="group-b">Put Ask</th><th class="group-b">Put Mid</th><th class="group-b">Put IV%</th><th class="group-b">Put OI</th>
         <th>Status</th>
       </tr></thead>
       <tbody>
@@ -591,67 +942,69 @@ tr:hover td{background:#f8fafc}
       {% endfor %}
       </tbody>
     </table>
-  </div>
+  </div></div>
 </div>
 {% endif %}
 
-<!-- BOX SPREAD ANALYSIS -->
+<!-- BOX SPREAD TABLE -->
 <div class="sec">
-  <div class="sh">
-    <span>Box Spread Analysis — {{ pairs|length }} pairs shown ({{ total }} total)</span>
-    <span style="font-size:11px;color:#94a3b8">Capital: ₹{{ "{:,.0f}".format(capital) }} &nbsp;·&nbsp; Tax bracket: {{ tax_rate|int }}% &nbsp;·&nbsp; Sorted by Ann. Return ↓</span>
+  <div class="sh sh-static">
+    <span>Box Spread Analysis — {{ pairs|length }} pairs &nbsp;·&nbsp; Capital ₹{{ "{:,.0f}".format(capital) }} &nbsp;·&nbsp; Tax {{ tax_rate|int }}% &nbsp;·&nbsp; Sorted by Ann. Return ↓</span>
   </div>
   <div class="tw">
     <table>
       <thead><tr>
-        <th class="l">K1</th><th class="l">K2</th><th>Width</th><th>DTE</th>
-        <th>C Ask(K1)</th><th>C Bid(K2)</th><th>P Ask(K2)</th><th>P Bid(K1)</th>
-        <th>Net Debit/lot</th><th>Box Value/lot</th>
-        <th>Entry STT</th><th>Settl. STT</th><th>Other Costs</th>
-        <th>Net P&L/lot</th><th>Return%</th><th>Ann.%</th>
-        <th>Post-Tax Ann%</th>
-        <th>Spread%</th>
-        <th>Max Lots (₹{{ "{:,.0f}".format(capital) }})</th>
-        <th>Total P&L if deployed</th>
+        <th class="l group-a">K1</th><th class="l group-a">K2</th><th class="group-a">Width</th><th class="group-a">DTE</th>
+        <th class="group-a">C Ask(K1)</th><th class="group-a">C Bid(K2)</th><th class="group-a">P Ask(K2)</th><th class="group-a">P Bid(K1)</th>
+        <th class="group-b">Net Debit</th><th class="group-b">Box Value</th>
+        <th class="group-b">Entry STT</th><th class="group-b">Settl STT</th><th class="group-b">Other Costs</th>
+        <th class="group-c">Net P&L/lot</th><th class="group-c">Return%</th><th class="group-c">Ann.%</th><th class="group-c">Post-Tax Ann%</th>
+        <th class="group-c">Spread%</th>
+        <th class="group-d">Impact Cost</th><th class="group-d">Adj P&L</th>
+        <th class="group-e">Max Lots</th><th class="group-e">Total P&L deployed</th>
+        <th class="group-e">OI Liquidity</th><th class="group-e">Bottleneck OI</th>
         <th>Signal</th>
       </tr></thead>
       <tbody>
-      {% if pairs %}
-        {% for p in pairs %}
+      {% if pairs %}{% for p in pairs %}
         <tr>
           <td class="l">{{ "{:,}".format(p.k1|int) }}</td>
           <td class="l">{{ "{:,}".format(p.k2|int) }}</td>
           <td>{{ "{:,}".format(p.box_w|int) }}</td>
           <td>{{ d.get('dte','?') }}</td>
-          <td>{{ "%.2f"|format(p.ca1) }}</td>
-          <td>{{ "%.2f"|format(p.cb2) }}</td>
-          <td>{{ "%.2f"|format(p.pa2) }}</td>
-          <td>{{ "%.2f"|format(p.pb1) }}</td>
-          <td>{{ inr(p.net_debit) }}</td>
-          <td>{{ inr(p.box_value) }}</td>
-          <td>{{ inr(p.entry_stt) }}</td>
-          <td>{{ inr(p.settl_stt) }}</td>
-          <td>{{ inr(p.other_costs) }}</td>
-          <td style="font-weight:700;color:{% if p.net_pnl >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(p.net_pnl) }}</td>
-          <td style="color:{% if p.ret_pct >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.ret_pct) }}</td>
-          <td style="font-weight:700;color:{% if p.ann_ret >= params.rfr %}#16a34a{% elif p.ann_ret >= 0 %}#d97706{% else %}#dc2626{% endif %}">{{ pct(p.ann_ret) }}</td>
-          <td style="font-weight:700;color:{% if p.post_tax_ann and p.post_tax_ann >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.post_tax_ann) }}</td>
-          <td>{% if p.spread_pct is not none %}{{ "%.2f"|format(p.spread_pct) }}%{% else %}—{% endif %}</td>
-          <td style="font-weight:600;{% if p.lots_possible >= 5 %}color:#16a34a{% elif p.lots_possible >= 1 %}color:#d97706{% else %}color:#dc2626{% endif %}">
-            {% if p.lots_possible > 0 %}{{ p.lots_possible }} lots{% else %}<span class="na">0 — insufficient capital</span>{% endif %}
+          <td>{{ "%.2f"|format(p.ca1) }}</td><td>{{ "%.2f"|format(p.cb2) }}</td>
+          <td>{{ "%.2f"|format(p.pa2) }}</td><td>{{ "%.2f"|format(p.pb1) }}</td>
+          <td>{{ inr(p.net_debit) }}</td><td>{{ inr(p.box_value) }}</td>
+          <td>{{ inr(p.entry_stt) }}</td><td>{{ inr(p.settl_stt) }}</td><td>{{ inr(p.other_costs) }}</td>
+          <td style="font-weight:700;color:{% if p.net_pnl>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(p.net_pnl) }}</td>
+          <td style="color:{% if p.ret_pct>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.ret_pct) }}</td>
+          <td style="font-weight:700;color:{% if p.ann_ret>=params.rfr %}#16a34a{% elif p.ann_ret>=0 %}#d97706{% else %}#dc2626{% endif %}">{{ pct(p.ann_ret) }}</td>
+          <td style="color:{% if p.post_tax_ann and p.post_tax_ann>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.post_tax_ann) }}</td>
+          <td>{% if p.spread_pct is not none %}{{ "%.2f"|format(p.spread_pct) }}%{% else %}<span class="na">—</span>{% endif %}</td>
+          <td style="color:{% if p.get('impact_cost') and p.get('impact_cost',0)>2000 %}#dc2626{% elif p.get('impact_cost') and p.get('impact_cost',0)>500 %}#d97706{% else %}#16a34a{% endif %}">
+            {% if p.get('impact_cost') is not none %}{{ inr(p.get('impact_cost')) }}{% else %}<span class="na">—</span>{% endif %}
           </td>
-          <td style="font-weight:700;color:{% if p.total_pnl and p.total_pnl >= 0 %}#16a34a{% else %}#dc2626{% endif %}">
-            {% if p.total_pnl is not none %}{{ inr(p.total_pnl) }}{% else %}<span class="na">—</span>{% endif %}
+          <td style="font-weight:700;color:{% if p.get('adj_net_pnl') is not none %}{% if p.get('adj_net_pnl',0)>=0 %}#16a34a{% else %}#dc2626{% endif %}{% else %}#94a3b8{% endif %}">
+            {% if p.get('adj_net_pnl') is not none %}{{ inr(p.get('adj_net_pnl')) }}{% else %}<span class="na">—</span>{% endif %}
+          </td>
+          <td style="font-weight:600;color:{% if p.lots_possible>=5 %}#16a34a{% elif p.lots_possible>=1 %}#d97706{% else %}#dc2626{% endif %}">
+            {% if p.lots_possible>0 %}{{ p.lots_possible }}{% else %}<span class="na">0</span>{% endif %}
+          </td>
+          <td style="font-weight:700;color:{% if p.adj_total_pnl is not none and p.adj_total_pnl>=0 %}#16a34a{% else %}#dc2626{% endif %}">
+            {% if p.adj_total_pnl is not none %}{{ inr(p.adj_total_pnl) }}{% elif p.total_pnl is not none %}{{ inr(p.total_pnl) }}{% else %}<span class="na">—</span>{% endif %}
+          </td>
+          <td title="{{ p.get('oi_note','') }}">{{ p.get('oi_flag','—') }}</td>
+          <td style="color:#64748b">
+            {% if p.get('bottleneck_oi') %}{{ "{:,}".format(p.bottleneck_oi|int) }} lots{% else %}<span class="na">—</span>{% endif %}
           </td>
           <td>
-            {% if p.signal == 'execute' %}<span class="pill pg">✅ EXECUTE</span>
-            {% elif p.signal == 'borderline' %}<span class="pill pa">⚠ BORDERLINE</span>
+            {% if p.signal=='execute' %}<span class="pill pg">✅ EXECUTE</span>
+            {% elif p.signal=='borderline' %}<span class="pill pa">⚠ BORDERLINE</span>
             {% else %}<span class="pill pr">❌ AVOID</span>{% endif %}
           </td>
         </tr>
-        {% endfor %}
-      {% else %}
-        <tr><td colspan="21"><div class="empty">{% if not authenticated %}Login at /admin{% elif not active %}Select an expiry{% else %}No pairs match this filter{% endif %}</div></td></tr>
+      {% endfor %}{% else %}
+        <tr><td colspan="25"><div class="empty">{% if not authenticated %}Login at /admin{% elif not active %}Select an expiry{% else %}No pairs match this filter{% endif %}</div></td></tr>
       {% endif %}
       </tbody>
     </table>
@@ -659,10 +1012,259 @@ tr:hover td{background:#f8fafc}
 </div>
 
 <div style="text-align:center;font-size:11px;color:#94a3b8;padding-bottom:20px">
-  Live data via Fyers API v3 &nbsp;·&nbsp; NSE European-style cash-settled index options &nbsp;·&nbsp; Not financial advice &nbsp;·&nbsp; Page auto-refreshes every {{ refresh_sec }}s
+  Live data via Fyers API v3 &nbsp;·&nbsp; NSE European-style cash-settled index options &nbsp;·&nbsp; Not financial advice &nbsp;·&nbsp;
+  Page auto-refreshes every {{ refresh_sec }}s &nbsp;·&nbsp; <a href="/calc" style="color:#3b82f6">Step-by-step calculator</a>
 </div>
 </div>
 </body></html>"""
+
+CALC_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Box Spread Calculator — Step by Step</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;background:#f0f2f5;color:#1a1a1a}
+.topbar{background:#0f172a;padding:12px 20px;display:flex;align-items:center;justify-content:space-between}
+.t1{font-size:15px;font-weight:700;color:#f8fafc}
+.t2{font-size:11px;color:#94a3b8;margin-top:2px}
+.main{padding:20px;max-width:900px;margin:0 auto}
+.sec{background:#fff;border-radius:9px;box-shadow:0 1px 2px rgba(0,0,0,.06);margin-bottom:16px;overflow:hidden}
+.sh{padding:10px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:13px}
+.sb{padding:16px}
+/* Input grid */
+.igrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px}
+.irow{display:flex;flex-direction:column;gap:4px}
+.irow label{font-size:11px;color:#64748b;font-weight:600}
+.irow span{font-size:10px;color:#94a3b8}
+.irow input{padding:8px 10px;border:1.5px solid #e2e8f0;border-radius:6px;font-size:14px;font-family:monospace;background:#fff;transition:border-color .15s}
+.irow input:focus{outline:none;border-color:#3b82f6}
+.btn{padding:9px 24px;background:#0f172a;color:#fff;border:none;border-radius:7px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+.btn:hover{background:#1e293b}
+/* Steps */
+.step{display:flex;align-items:flex-start;gap:14px;padding:10px 0;border-bottom:1px solid #f1f5f9}
+.step:last-child{border-bottom:none}
+.step-num{width:24px;height:24px;border-radius:50%;background:#0f172a;color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.step-body{flex:1}
+.step-title{font-weight:600;font-size:13px;margin-bottom:2px}
+.step-formula{font-family:monospace;font-size:11px;color:#64748b;margin-bottom:4px;background:#f8fafc;padding:3px 7px;border-radius:4px;display:inline-block}
+.step-result{font-family:monospace;font-size:15px;font-weight:700;color:#0f172a}
+.step-note{font-size:11px;color:#94a3b8;margin-top:3px}
+.step-num.g{background:#16a34a}
+.step-num.r{background:#dc2626}
+.step-num.a{background:#d97706}
+/* Summary box */
+.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:4px}
+.scard{border-radius:8px;padding:12px 14px;text-align:center}
+.scard-label{font-size:11px;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:.4px}
+.scard-val{font-size:22px;font-weight:700;font-family:monospace}
+.verdict{border-radius:8px;padding:14px 18px;margin-top:12px;font-size:14px;font-weight:600;text-align:center}
+.sub{font-size:11px;color:#64748b;margin-top:3px;font-weight:400}
+a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div>
+    <div class="t1">Box Spread Step-by-Step Calculator</div>
+    <div class="t2">Enter any 4 prices manually — every calculation shown transparently</div>
+  </div>
+  <a href="/" style="color:#94a3b8;font-size:12px">← Back to scanner</a>
+</div>
+
+<div class="main">
+<!-- INPUT FORM -->
+<div class="sec">
+  <div class="sh">Enter the 4 leg prices (from any source — live quote, Excel, or manual)</div>
+  <div class="sb">
+    <form method="GET" action="/calc">
+      <div class="igrid">
+        <div class="irow">
+          <label>K1 — Lower Strike</label>
+          <input type="number" name="k1" value="{{ k1|int }}" step="50">
+          <span>e.g. 24000</span>
+        </div>
+        <div class="irow">
+          <label>K2 — Higher Strike</label>
+          <input type="number" name="k2" value="{{ k2|int }}" step="50">
+          <span>e.g. 25000</span>
+        </div>
+        <div class="irow">
+          <label>Days to Expiry (DTE)</label>
+          <input type="number" name="dte" value="{{ dte|int }}" step="1">
+          <span>e.g. 89</span>
+        </div>
+        <div style=""></div>
+        <div class="irow">
+          <label>📞 Call Ask at K1 (BUY)</label>
+          <input type="number" name="ca1" value="{{ ca1 }}" step="0.05">
+          <span>You pay this — debit leg</span>
+        </div>
+        <div class="irow">
+          <label>📞 Call Bid at K2 (SELL)</label>
+          <input type="number" name="cb2" value="{{ cb2 }}" step="0.05">
+          <span>You receive this — credit leg</span>
+        </div>
+        <div class="irow">
+          <label>🔵 Put Ask at K2 (BUY)</label>
+          <input type="number" name="pa2" value="{{ pa2 }}" step="0.05">
+          <span>You pay this — debit leg</span>
+        </div>
+        <div class="irow">
+          <label>🔵 Put Bid at K1 (SELL)</label>
+          <input type="number" name="pb1" value="{{ pb1 }}" step="0.05">
+          <span>You receive this — credit leg</span>
+        </div>
+      </div>
+      <button type="submit" class="btn">Calculate →</button>
+      &nbsp;&nbsp;<span style="font-size:11px;color:#94a3b8">Lot size: {{ params.lot_size }} · Lots: {{ params.num_lots }} · Total units: {{ lots }}</span>
+    </form>
+  </div>
+</div>
+
+{% if has_input %}
+<!-- STEP BY STEP BREAKDOWN -->
+<div class="sec">
+  <div class="sh">Step-by-Step Calculation — K1={{ k1|int }} / K2={{ k2|int }} / DTE={{ dte|int }}</div>
+  <div class="sb">
+
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <div class="step-title">Box Width &amp; Settlement Value</div>
+        <div class="step-formula">Box Width = K2 − K1 = {{ k2|int }} − {{ k1|int }} = {{ box_w|int }}</div><br>
+        <div class="step-formula">Box Value (per lot) = Box Width × Lot Size = {{ box_w|int }} × {{ params.lot_size }} = {{ box_val|int }}</div>
+        <div class="step-note">This is what the box ALWAYS settles at on expiry — regardless of where NIFTY is. Fully direction-neutral.</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <div class="step-title">Net Debit (what you pay to enter)</div>
+        <div class="step-formula">Per unit = Call Ask(K1) + Put Ask(K2) − Call Bid(K2) − Put Bid(K1)</div>
+        <div class="step-formula">= {{ ca1 }} + {{ pa2 }} − {{ cb2 }} − {{ pb1 }} = {{ "%.4f"|format(net_debit_unit) }} per unit</div>
+        <div class="step-formula">Per lot = {{ "%.4f"|format(net_debit_unit) }} × {{ lots }} units = <strong>{{ inr(net_debit_total) }}</strong></div>
+        <div class="step-note">This is your capital deployed. You pay this upfront to enter the position.</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <div class="step-title">Gross Profit (before all costs)</div>
+        <div class="step-formula">Box Value − Net Debit = {{ inr(box_val) }} − {{ inr(net_debit_total) }} = {{ inr(box_val - net_debit_total) }}</div>
+        <div class="step-note">This is the theoretical profit if there were zero transaction costs. Real profit will be lower.</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <div class="step-title">Entry STT — Securities Transaction Tax (sell legs)</div>
+        <div class="step-formula">Sell Premium = Call Bid(K2) + Put Bid(K1) = {{ cb2 }} + {{ pb1 }} = {{ cb2 + pb1 }} per unit</div>
+        <div class="step-formula">Sell Premium (lot) = {{ cb2 + pb1 }} × {{ lots }} = {{ (cb2 + pb1) * lots }}</div>
+        <div class="step-formula">Entry STT = {{ params.stt_entry_pct }}% × {{ (cb2 + pb1) * lots }} = <strong>{{ inr(entry_stt) }}</strong></div>
+        <div class="step-note">STT charged only on sell-side premiums at entry. Deep ITM sells (high premium) = high STT.</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">5</div>
+      <div class="step-body">
+        <div class="step-title">Settlement STT — charged at expiry (always)</div>
+        <div class="step-formula">Settlement STT = {{ params.stt_settl_pct }}% × Box Value = {{ params.stt_settl_pct }}% × {{ inr(box_val) }} = <strong>{{ inr(settl_stt) }}</strong></div>
+        <div class="step-note">⚠ This is unique to box spreads held to expiry. NSE charges 0.125% on the intrinsic settlement value. Cannot be avoided.</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">6</div>
+      <div class="step-body">
+        <div class="step-title">Brokerage + GST</div>
+        <div class="step-formula">Brokerage = 4 legs × ₹{{ params.broker_per_leg }} = ₹{{ brokerage }}</div>
+        <div class="step-formula">GST ({{ params.gst_pct }}%) = ₹{{ "%.2f"|format(gst) }}</div>
+        <div class="step-formula">Total = <strong>₹{{ "%.2f"|format(brokerage + gst) }}</strong></div>
+        <div class="step-note">Fixed regardless of trade size — hurts small capital boxes disproportionately.</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">7</div>
+      <div class="step-body">
+        <div class="step-title">NSE Transaction Charges</div>
+        <div class="step-formula">Total Premium (all 4 legs) = ({{ ca1 }} + {{ pa2 }} + {{ cb2 }} + {{ pb1 }}) × {{ lots }} = {{ "%.2f"|format(total_prem) }}</div>
+        <div class="step-formula">NSE Txn ({{ params.txn_pct }}%) = <strong>{{ inr(txn_charge) }}</strong> &nbsp;&nbsp; SEBI ({{ params.sebi_pct }}%) = <strong>{{ inr(sebi_chg) }}</strong></div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">8</div>
+      <div class="step-body">
+        <div class="step-title">Stamp Duty + Slippage</div>
+        <div class="step-formula">Buy Premium = ({{ ca1 }} + {{ pa2 }}) × {{ lots }} = {{ "%.2f"|format(buy_prem) }}</div>
+        <div class="step-formula">Stamp Duty ({{ params.stamp_pct }}% of buy premium) = <strong>{{ inr(stamp) }}</strong></div>
+        <div class="step-formula">Slippage = 4 legs × {{ params.slip_per_leg }} pts × {{ lots }} units = <strong>{{ inr(slip) }}</strong></div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num {% if net_pnl >= 0 %}g{% else %}r{% endif %}">9</div>
+      <div class="step-body">
+        <div class="step-title">Final Net P&L</div>
+        <div class="step-formula">Box Value − Net Debit − Entry STT − Settlement STT − Other Costs</div>
+        <div class="step-formula">= {{ inr(box_val) }} − {{ inr(net_debit_total) }} − {{ inr(entry_stt) }} − {{ inr(settl_stt) }} − {{ inr(other_costs) }}</div>
+        <div class="step-formula" style="font-size:13px">= <strong style="color:{% if net_pnl >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(net_pnl) }}</strong></div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num {% if ann_ret >= params.rfr %}g{% elif ann_ret >= 0 %}a{% else %}r{% endif %}">10</div>
+      <div class="step-body">
+        <div class="step-title">Annualised Return</div>
+        <div class="step-formula">Return % = Net P&L ÷ Net Debit = {{ inr(net_pnl) }} ÷ {{ inr(net_debit_total) }} = {{ "%.4f"|format(ret_pct) }}%</div>
+        <div class="step-formula">Annualised = Return% × (365 ÷ DTE) = {{ "%.4f"|format(ret_pct) }}% × (365 ÷ {{ dte|int }}) = <strong>{{ pct(ann_ret) }}</strong></div>
+        <div class="step-note">Risk-free rate (FD/T-bill): {{ params.rfr }}% — {% if ann_ret >= params.rfr %}✅ Beats RFR by {{ "%.2f"|format(ann_ret - params.rfr) }}%{% else %}❌ Below RFR — not a true arbitrage{% endif %}</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- SUMMARY -->
+<div class="sec">
+  <div class="sh">Summary</div>
+  <div class="sb">
+    <div class="summary">
+      <div class="scard" style="background:#f0fdf4">
+        <div class="scard-label">Net P&L per lot</div>
+        <div class="scard-val" style="color:{% if net_pnl >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(net_pnl) }}</div>
+      </div>
+      <div class="scard" style="background:#eff6ff">
+        <div class="scard-label">Annualised Return</div>
+        <div class="scard-val" style="color:#2563eb">{{ pct(ann_ret) }}</div>
+      </div>
+      <div class="scard" style="background:#f8fafc">
+        <div class="scard-label">Capital Deployed</div>
+        <div class="scard-val" style="color:#0f172a">{{ inr(net_debit_total) }}</div>
+      </div>
+    </div>
+    <div class="verdict" style="background:{% if net_pnl > 0 and ann_ret >= params.rfr %}#f0fdf4;color:#15803d;border:1px solid #bbf7d0{% elif net_pnl > 0 %}#fefce8;color:#854d0e;border:1px solid #fef08a{% else %}#fef2f2;color:#b91c1c;border:1px solid #fecaca{% endif %}">
+      {% if net_pnl > 0 and ann_ret >= params.rfr %}
+        ✅ EXECUTE — Net profit {{ inr(net_pnl) }}/lot at {{ pct(ann_ret) }} p.a. — beats risk-free rate by {{ "%.2f"|format(ann_ret - params.rfr) }}%
+      {% elif net_pnl > 0 %}
+        ⚠ BORDERLINE — Profitable ({{ inr(net_pnl) }}/lot) but {{ pct(ann_ret) }} p.a. does not beat the {{ params.rfr }}% risk-free rate
+      {% else %}
+        ❌ AVOID — Net loss of {{ inr(net_pnl|abs) }}/lot after all costs
+      {% endif %}
+      <div class="sub">Cost breakdown: Entry STT {{ inr(entry_stt) }} + Settlement STT {{ inr(settl_stt) }} + Brokerage+GST ₹{{ "%.2f"|format(brokerage+gst) }} + Txn/SEBI {{ inr(txn_charge+sebi_chg) }} + Stamp+Slip {{ inr(stamp+slip) }} = Total costs {{ inr(entry_stt+settl_stt+other_costs) }}</div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+</div></body></html>"""
 
 ADMIN_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Admin</title>
