@@ -12,7 +12,7 @@ APP_URL          = os.environ.get("APP_URL", "http://localhost:5000")
 REFRESH_SEC      = int(os.environ.get("REFRESH_SECONDS", "60"))
 
 PARAMS = {
-    "lot_size":       int(os.environ.get("LOT_SIZE", "75")),
+    "lot_size":       int(os.environ.get("LOT_SIZE", "65")),
     "num_lots":       int(os.environ.get("NUM_LOTS", "1")),
     "broker_per_leg": float(os.environ.get("BROKER_PER_LEG", "20")),
     "stt_entry_pct":  float(os.environ.get("STT_ENTRY_PCT", "0.05")),
@@ -246,27 +246,49 @@ def num(v, dec=2):
 def index():
     active = request.args.get("expiry") or (state["expiries"][0] if state["expiries"] else None)
     d = state["data"].get(active, {}) if active else {}
-    chain = d.get("chain", [])
-    pairs = d.get("pairs", [])
+    all_pairs = d.get("pairs", [])
     sig_filter = request.args.get("sig", "all")
-    if sig_filter != "all":
-        pairs = [p for p in pairs if p["signal"] == sig_filter]
-    arb = sum(1 for p in d.get("pairs", []) if p["signal"] == "execute")
-    bord = sum(1 for p in d.get("pairs", []) if p["signal"] == "borderline")
-    loss = sum(1 for p in d.get("pairs", []) if p["signal"] == "loss")
-    best = max((p["net_pnl"] for p in d.get("pairs", [])), default=None)
-    maxann = max((p["ann_ret"] for p in d.get("pairs", [])), default=None)
+    # Tax bracket
+    try:
+        tax_rate = float(request.args.get("tax", "30"))
+    except Exception:
+        tax_rate = 30.0
+    # Capital
+    try:
+        capital = float(request.args.get("capital", "300000"))
+    except Exception:
+        capital = 300000.0
+    # Filter pairs
+    pairs = all_pairs if sig_filter == "all" else [p for p in all_pairs if p["signal"] == sig_filter]
+    arb  = sum(1 for p in all_pairs if p["signal"] == "execute")
+    bord = sum(1 for p in all_pairs if p["signal"] == "borderline")
+    loss = sum(1 for p in all_pairs if p["signal"] == "loss")
+    best    = max((p["net_pnl"]  for p in all_pairs), default=None)
+    maxann  = max((p["ann_ret"]  for p in all_pairs), default=None)
+    # Enrich pairs with post-tax return and capital analysis
+    enriched = []
+    for p in pairs:
+        lots_possible = int(capital // p["net_debit"]) if p["net_debit"] > 0 else 0
+        total_pnl     = p["net_pnl"] * lots_possible if lots_possible > 0 else None
+        post_tax_ann  = p["ann_ret"] * (1 - tax_rate / 100) if p["ann_ret"] is not None else None
+        enriched.append({**p,
+            "lots_possible": lots_possible,
+            "total_pnl":     round(total_pnl, 0) if total_pnl is not None else None,
+            "post_tax_ann":  round(post_tax_ann, 2) if post_tax_ann is not None else None,
+        })
     return render_template_string(PAGE,
         expiries=state["expiries"], active=active,
-        d=d, chain=chain, pairs=pairs,
+        d=d, chain=d.get("chain", []), pairs=enriched,
         arb=arb, bord=bord, loss=loss,
-        total=len(d.get("pairs", [])),
+        total=len(all_pairs),
         best=best, maxann=maxann,
         params=PARAMS, inr=inr, pct=pct, num=num,
         last_fetch=state["last_fetch"],
         global_error=state["global_error"],
         authenticated=is_authenticated(),
         sig_filter=sig_filter,
+        tax_rate=tax_rate,
+        capital=capital,
         refresh_sec=REFRESH_SEC,
     )
 
@@ -315,33 +337,45 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
 .t2{font-size:11px;color:#94a3b8;margin-top:2px}
 .live{display:flex;align-items:center;gap:6px;font-size:12px;color:#94a3b8}
 .dot{width:7px;height:7px;border-radius:50%;background:{% if authenticated and not global_error %}#22c55e{% else %}#ef4444{% endif %}}
-.main{padding:16px 20px;max-width:1500px;margin:0 auto}
+.main{padding:16px 20px;max-width:1600px;margin:0 auto}
 .err{background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px 14px;color:#b91c1c;font-size:12px;margin-bottom:12px}
-/* Expiry bar */
 .ebar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;align-items:center}
 .elabel{font-size:11px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
 .eb{padding:4px 12px;border-radius:5px;border:1px solid #e2e8f0;background:#fff;text-decoration:none;font-size:12px;color:#475569;font-weight:500}
-.eb:hover{border-color:#94a3b8;color:#0f172a}
-.eb.on{background:#0f172a;color:#fff;border-color:#0f172a}
+.eb:hover{border-color:#94a3b8}.eb.on{background:#0f172a;color:#fff;border-color:#0f172a}
 .arbn{display:inline-block;margin-left:4px;background:#dcfce7;color:#15803d;border-radius:3px;padding:1px 4px;font-size:10px;font-weight:700}
 .eb.on .arbn{background:#22c55e;color:#fff}
-/* Scorecard */
 .cards{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}
 @media(max-width:900px){.cards{grid-template-columns:repeat(3,1fr)}}
 .card{background:#fff;border-radius:9px;padding:12px 14px;box-shadow:0 1px 2px rgba(0,0,0,.06)}
 .cl{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
 .cv{font-size:20px;font-weight:700;font-family:'Courier New',monospace}
 .g{color:#16a34a}.a{color:#d97706}.r{color:#dc2626}.b{color:#2563eb}
-/* Section */
 .sec{background:#fff;border-radius:9px;box-shadow:0 1px 2px rgba(0,0,0,.06);margin-bottom:14px;overflow:hidden}
 .sh{padding:10px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:13px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
 .sb{padding:14px 16px}
 /* Assumptions grid */
-.agrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
-@media(max-width:800px){.agrid{grid-template-columns:repeat(2,1fr)}}
-.arow{background:#f8fafc;border-radius:6px;padding:8px 10px;display:flex;justify-content:space-between;align-items:center}
-.ak{font-size:11px;color:#64748b}
-.av{font-size:13px;font-weight:600;font-family:'Courier New',monospace;color:#0f172a}
+.agrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+@media(max-width:900px){.agrid{grid-template-columns:repeat(2,1fr)}}
+.acard{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px}
+.acard-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px}
+.aname{font-size:12px;font-weight:600;color:#0f172a}
+.aval{font-size:14px;font-weight:700;font-family:'Courier New',monospace;color:#2563eb;white-space:nowrap;margin-left:8px}
+.adesc{font-size:11px;color:#64748b;line-height:1.5}
+.awhy{font-size:10px;color:#94a3b8;margin-top:3px;font-style:italic}
+/* Interactive controls */
+.ctrl-bar{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;padding:12px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0}
+.ctrl-group{display:flex;flex-direction:column;gap:4px}
+.ctrl-label{font-size:11px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+.ctrl-input{padding:6px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;font-family:'Courier New',monospace;background:#fff;width:140px}
+.ctrl-btn{padding:7px 16px;background:#0f172a;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;align-self:flex-end}
+/* Filter tabs */
+.ftabs{display:flex;gap:6px;flex-wrap:wrap}
+.ft{padding:5px 14px;border-radius:6px;border:1px solid #e2e8f0;background:#fff;text-decoration:none;font-size:12px;color:#475569;font-weight:500}
+.ft:hover{border-color:#94a3b8}.ft.on{background:#0f172a;color:#fff;border-color:#0f172a}
+.ft.g-on{background:#16a34a;color:#fff;border-color:#16a34a}
+.ft.a-on{background:#d97706;color:#fff;border-color:#d97706}
+.ft.r-on{background:#dc2626;color:#fff;border-color:#dc2626}
 /* Tables */
 .tw{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:11.5px}
@@ -351,18 +385,13 @@ td{padding:6px 10px;border-bottom:1px solid #f1f5f9;text-align:right;font-family
 td.l{text-align:left;font-family:inherit;font-weight:600}
 tr:hover td{background:#f8fafc}
 .pill{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:700;font-family:inherit}
-.pg{background:#dcfce7;color:#15803d}
-.pa{background:#fef3c7;color:#92400e}
-.pr{background:#fee2e2;color:#b91c1c}
-.ps{background:#f1f5f9;color:#64748b}
-/* filters */
-.fbar{display:flex;gap:5px;flex-wrap:wrap}
-.fb{padding:3px 10px;border-radius:4px;border:1px solid #e2e8f0;background:#fff;text-decoration:none;font-size:11px;color:#64748b}
-.fb:hover{border-color:#94a3b8}
-.fb.on{background:#0f172a;color:#fff;border-color:#0f172a}
+.pg{background:#dcfce7;color:#15803d}.pa{background:#fef3c7;color:#92400e}
+.pr{background:#fee2e2;color:#b91c1c}.ps{background:#f1f5f9;color:#64748b}
 .empty{text-align:center;padding:40px;color:#94a3b8;font-size:13px}
-.ref{font-size:11px;color:#94a3b8}
-.na{color:#94a3b8}
+.na{color:#cbd5e1}
+.cap-hi{background:#f0fdf4;color:#15803d;font-weight:700}
+.cap-med{background:#fefce8;color:#854d0e}
+.cap-lo{background:#fff7ed;color:#c2410c}
 </style>
 </head>
 <body>
@@ -389,14 +418,13 @@ tr:hover td{background:#f8fafc}
   <span class="elabel">Expiry</span>
   {% if expiries %}
     {% for e in expiries %}
-      {% set ed = state_data.get(e, {}) %}
-      {% set en = ed.get('arb_count', 0) %}
-      <a href="/?expiry={{ e }}&sig={{ sig_filter }}" class="eb {% if e == active %}on{% endif %}">
+      {% set en = state_data.get(e, {}).get('arb_count', 0) %}
+      <a href="/?expiry={{ e }}&sig={{ sig_filter }}&tax={{ tax_rate }}&capital={{ capital|int }}" class="eb {% if e == active %}on{% endif %}">
         {{ e }}{% if en > 0 %}<span class="arbn">{{ en }}</span>{% endif %}
       </a>
     {% endfor %}
   {% else %}
-    <span style="font-size:12px;color:#94a3b8">{% if authenticated %}Loading expiries...{% else %}Login at <a href="/admin">/admin</a> to load data{% endif %}</span>
+    <span style="font-size:12px;color:#94a3b8">{% if authenticated %}Loading...{% else %}Login at <a href="/admin">/admin</a>{% endif %}</span>
   {% endif %}
 </div>
 
@@ -412,25 +440,118 @@ tr:hover td{background:#f8fafc}
 
 <!-- ASSUMPTIONS -->
 <div class="sec">
-  <div class="sh">Assumptions (read-only)</div>
+  <div class="sh">
+    <span>Assumptions</span>
+    <span style="font-size:11px;color:#94a3b8">These are the inputs that drive every calculation below — hover each card to understand its role</span>
+  </div>
   <div class="sb">
     <div class="agrid">
-      <div class="arow"><span class="ak">Lot Size (NIFTY)</span><span class="av">{{ params.lot_size }} units</span></div>
-      <div class="arow"><span class="ak">Number of Lots</span><span class="av">{{ params.num_lots }}</span></div>
-      <div class="arow"><span class="ak">Brokerage per Leg</span><span class="av">₹{{ params.broker_per_leg }}</span></div>
-      <div class="arow"><span class="ak">GST on Brokerage</span><span class="av">{{ params.gst_pct }}%</span></div>
-      <div class="arow"><span class="ak">Entry STT (sell legs)</span><span class="av">{{ params.stt_entry_pct }}%</span></div>
-      <div class="arow"><span class="ak">Settlement STT</span><span class="av">{{ params.stt_settl_pct }}%</span></div>
-      <div class="arow"><span class="ak">NSE Txn Charge</span><span class="av">{{ params.txn_pct }}%</span></div>
-      <div class="arow"><span class="ak">SEBI Charge</span><span class="av">{{ params.sebi_pct }}%</span></div>
-      <div class="arow"><span class="ak">Stamp Duty (buy side)</span><span class="av">{{ params.stamp_pct }}%</span></div>
-      <div class="arow"><span class="ak">Slippage per Leg</span><span class="av">{{ params.slip_per_leg }} pts</span></div>
-      <div class="arow"><span class="ak">Risk-Free Rate</span><span class="av">{{ params.rfr }}%</span></div>
-      <div class="arow"><span class="ak">Min Ann. Return</span><span class="av">{{ params.min_ann_ret }}%</span></div>
-      <div class="arow"><span class="ak">Max Spread %</span><span class="av">{{ params.max_spread_pct }}%</span></div>
-      <div class="arow"><span class="ak">Fixed Cost/Box (excl STT)</span><span class="av">₹{{ "%.2f"|format(4 * params.broker_per_leg * (1 + params.gst_pct/100)) }}</span></div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Lot Size (NIFTY)</span><span class="aval">{{ params.lot_size }} units</span></div>
+        <div class="adesc">Number of NIFTY units in one futures/options lot. NSE sets this — currently 75 for weekly, 65 for monthly.</div>
+        <div class="awhy">Why it matters: All P&L is multiplied by lot size. A ₹100/unit profit on 65 units = ₹6,500.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Number of Lots</span><span class="aval">{{ params.num_lots }}</span></div>
+        <div class="adesc">How many lots you trade per box spread. Change this to scale up or down your position.</div>
+        <div class="awhy">Why it matters: All costs and P&L scale linearly with lots. 2 lots = 2× P&L and 2× capital deployed.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Brokerage per Leg</span><span class="aval">₹{{ params.broker_per_leg }}</span></div>
+        <div class="adesc">Flat fee charged per order leg. A box spread has 4 legs (2 calls + 2 puts), so total brokerage = 4 × ₹20 = ₹80.</div>
+        <div class="awhy">Why it matters: Fixed cost regardless of trade size. For small capital boxes, this can wipe the arb edge.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">GST on Brokerage</span><span class="aval">{{ params.gst_pct }}%</span></div>
+        <div class="adesc">18% GST applied only on the brokerage component, not on premiums. Mandatory government tax.</div>
+        <div class="awhy">Why it matters: Adds ₹14.40 to the ₹80 brokerage = ₹94.40 fixed cost floor per box.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Entry STT (sell legs)</span><span class="aval">{{ params.stt_entry_pct }}%</span></div>
+        <div class="adesc">Securities Transaction Tax on sell-side option premiums at entry. Charged on Sell Call(K2) + Sell Put(K1) premiums.</div>
+        <div class="awhy">Why it matters: Deep ITM sell legs carry large premiums → large STT. Often the #1 cost killer for wide boxes.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Settlement STT</span><span class="aval">{{ params.stt_settl_pct }}%</span></div>
+        <div class="adesc">0.125% STT charged on the intrinsic value at expiry settlement. This is ALWAYS charged when holding to expiry.</div>
+        <div class="awhy">Why it matters: This is the critical cost unique to box spreads held to expiry. On a ₹1,000 wide box: ₹81.25 per lot in settlement STT alone.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">NSE Txn Charge</span><span class="aval">{{ params.txn_pct }}%</span></div>
+        <div class="adesc">NSE exchange transaction charge: ₹3,503 per crore of premium turnover (0.03503%). Applied on total premium of all 4 legs.</div>
+        <div class="awhy">Why it matters: Proportional to premium size. High-premium deep-ITM boxes pay more here.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">SEBI Charge</span><span class="aval">{{ params.sebi_pct }}%</span></div>
+        <div class="adesc">SEBI regulatory fee: ₹10 per crore of premium turnover (0.0001%). Very small but legally mandatory.</div>
+        <div class="awhy">Why it matters: Negligible in absolute terms but included for precision — every paisa counts in arb.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Stamp Duty (buy side)</span><span class="aval">{{ params.stamp_pct }}%</span></div>
+        <div class="adesc">State stamp duty charged only on buy-side premiums — Buy Call(K1) Ask + Buy Put(K2) Ask.</div>
+        <div class="awhy">Why it matters: Only on buy legs, so buying deep-ITM calls (high premium) increases this cost.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Slippage per Leg</span><span class="aval">{{ params.slip_per_leg }} pts</span></div>
+        <div class="adesc">Assumed execution slippage (0.5 index points per leg) — conservative estimate for getting filled at the quoted price.</div>
+        <div class="awhy">Why it matters: Wide bid-ask spreads in illiquid strikes mean you may not get the quoted price. 4 legs × 0.5 pts = 2 pts total.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Risk-Free Rate</span><span class="aval">{{ params.rfr }}%</span></div>
+        <div class="adesc">Current 91-day T-bill / RBI repo rate benchmark. Used to measure if the box spread return beats simply putting money in a FD.</div>
+        <div class="awhy">Why it matters: A box spread returning 6.4% when the RFR is 6.5% is NOT an arbitrage — you'd earn more in a FD.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Min Ann. Return Threshold</span><span class="aval">{{ params.min_ann_ret }}%</span></div>
+        <div class="adesc">Minimum annualized return required to flag a pair as EXECUTE (not just borderline). Set above the RFR.</div>
+        <div class="awhy">Why it matters: Filters out pairs that technically profit but don't beat a simple FD after all friction costs.</div>
+      </div>
+      <div class="acard">
+        <div class="acard-top"><span class="aname">Max Bid-Ask Spread %</span><span class="aval">{{ params.max_spread_pct }}%</span></div>
+        <div class="adesc">Maximum allowable bid-ask spread (as % of box width) across all 4 legs. Measures execution risk.</div>
+        <div class="awhy">Why it matters: Wide spreads mean the theoretical price may not be the fill price. High spread = arb may evaporate on execution.</div>
+      </div>
+      <div class="acard" style="border-color:#3b82f6;background:#eff6ff">
+        <div class="acard-top"><span class="aname">Fixed Cost/Box (excl STT)</span><span class="aval" style="color:#1d4ed8">₹{{ "%.2f"|format(4 * params.broker_per_leg * (1 + params.gst_pct/100)) }}</span></div>
+        <div class="adesc">The minimum unavoidable fixed cost per box spread: brokerage (₹80) + GST (₹14.40). This is your floor cost before variable charges.</div>
+        <div class="awhy">Why it matters: Any pair where box value − net debit &lt; ₹94.40 is a guaranteed loss regardless of premiums.</div>
+      </div>
     </div>
   </div>
+</div>
+
+<!-- INTERACTIVE CONTROLS -->
+<div class="sec">
+  <div class="sh">Analysis Controls</div>
+  <form method="GET" action="/">
+    <input type="hidden" name="expiry" value="{{ active or '' }}">
+    <div class="ctrl-bar">
+      <div class="ctrl-group">
+        <label class="ctrl-label">Income Tax Bracket</label>
+        <select name="tax" class="ctrl-input" style="width:160px">
+          {% for t in [0, 5, 10, 15, 20, 25, 30] %}
+          <option value="{{ t }}" {% if tax_rate == t %}selected{% endif %}>{{ t }}% — {% if t==0 %}No tax (exempt){% elif t==5 %}Up to ₹3L income{% elif t==10 %}Up to ₹6L income{% elif t==15 %}Up to ₹9L income{% elif t==20 %}Up to ₹12L income{% elif t==25 %}Up to ₹15L income{% else %}Above ₹15L income{% endif %}</option>
+          {% endfor %}
+        </select>
+        <span style="font-size:10px;color:#94a3b8;margin-top:2px">Box spread gains = STCG, taxed at your slab rate</span>
+      </div>
+      <div class="ctrl-group">
+        <label class="ctrl-label">Deployable Capital (₹)</label>
+        <input type="number" name="capital" class="ctrl-input" value="{{ capital|int }}" step="10000" style="width:180px">
+        <span style="font-size:10px;color:#94a3b8;margin-top:2px">How much capital you want to allocate</span>
+      </div>
+      <div class="ctrl-group">
+        <label class="ctrl-label">Signal Filter</label>
+        <select name="sig" class="ctrl-input" style="width:180px">
+          <option value="all" {% if sig_filter=='all' %}selected{% endif %}>All pairs ({{ total }})</option>
+          <option value="execute" {% if sig_filter=='execute' %}selected{% endif %}>✔ Execute only ({{ arb }})</option>
+          <option value="borderline" {% if sig_filter=='borderline' %}selected{% endif %}>⚠ Borderline ({{ bord }})</option>
+          <option value="loss" {% if sig_filter=='loss' %}selected{% endif %}>✘ Loss — avoid ({{ loss }})</option>
+        </select>
+      </div>
+      <button type="submit" class="ctrl-btn">Apply →</button>
+    </div>
+  </form>
 </div>
 
 <!-- OPTION CHAIN -->
@@ -438,16 +559,14 @@ tr:hover td{background:#f8fafc}
 <div class="sec">
   <div class="sh">
     <span>Option Chain — {{ active }} ({{ chain|length }} strikes)</span>
-    <span class="ref">Buy at Ask · Sell at Bid</span>
+    <span style="font-size:11px;color:#94a3b8">Buy at Ask · Sell at Bid · Mid = theoretical fair value</span>
   </div>
   <div class="tw">
     <table>
       <thead><tr>
         <th class="l">Strike (K)</th>
-        <th>Call Bid</th><th>Call Ask</th><th>Call Mid</th>
-        <th>Call IV%</th><th>Call OI</th>
-        <th>Put Bid</th><th>Put Ask</th><th>Put Mid</th>
-        <th>Put IV%</th><th>Put OI</th>
+        <th>Call Bid</th><th>Call Ask</th><th>Call Mid</th><th>Call IV%</th><th>Call OI</th>
+        <th>Put Bid</th><th>Put Ask</th><th>Put Mid</th><th>Put IV%</th><th>Put OI</th>
         <th>Status</th>
       </tr></thead>
       <tbody>
@@ -479,22 +598,22 @@ tr:hover td{background:#f8fafc}
 <!-- BOX SPREAD ANALYSIS -->
 <div class="sec">
   <div class="sh">
-    <span>Box Spread Analysis — {{ total }} complete pairs</span>
-    <div class="fbar">
-      <a href="/?expiry={{ active }}&sig=all"   class="fb {% if sig_filter=='all' %}on{% endif %}">All ({{ total }})</a>
-      <a href="/?expiry={{ active }}&sig=execute"    class="fb {% if sig_filter=='execute' %}on{% endif %}">✔ Execute ({{ arb }})</a>
-      <a href="/?expiry={{ active }}&sig=borderline" class="fb {% if sig_filter=='borderline' %}on{% endif %}">⚠ Borderline ({{ bord }})</a>
-      <a href="/?expiry={{ active }}&sig=loss"       class="fb {% if sig_filter=='loss' %}on{% endif %}">✘ Loss ({{ loss }})</a>
-    </div>
+    <span>Box Spread Analysis — {{ pairs|length }} pairs shown ({{ total }} total)</span>
+    <span style="font-size:11px;color:#94a3b8">Capital: ₹{{ "{:,.0f}".format(capital) }} &nbsp;·&nbsp; Tax bracket: {{ tax_rate|int }}% &nbsp;·&nbsp; Sorted by Ann. Return ↓</span>
   </div>
   <div class="tw">
     <table>
       <thead><tr>
         <th class="l">K1</th><th class="l">K2</th><th>Width</th><th>DTE</th>
         <th>C Ask(K1)</th><th>C Bid(K2)</th><th>P Ask(K2)</th><th>P Bid(K1)</th>
-        <th>Net Debit</th><th>Box Value</th>
+        <th>Net Debit/lot</th><th>Box Value/lot</th>
         <th>Entry STT</th><th>Settl. STT</th><th>Other Costs</th>
-        <th>Net P&L</th><th>Return%</th><th>Ann.%</th><th>Spread%</th><th>Signal</th>
+        <th>Net P&L/lot</th><th>Return%</th><th>Ann.%</th>
+        <th>Post-Tax Ann%</th>
+        <th>Spread%</th>
+        <th>Max Lots (₹{{ "{:,.0f}".format(capital) }})</th>
+        <th>Total P&L if deployed</th>
+        <th>Signal</th>
       </tr></thead>
       <tbody>
       {% if pairs %}
@@ -515,8 +634,15 @@ tr:hover td{background:#f8fafc}
           <td>{{ inr(p.other_costs) }}</td>
           <td style="font-weight:700;color:{% if p.net_pnl >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(p.net_pnl) }}</td>
           <td style="color:{% if p.ret_pct >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.ret_pct) }}</td>
-          <td style="font-weight:700;color:{% if p.ann_ret >= 1 %}#16a34a{% elif p.ann_ret >= 0 %}#d97706{% else %}#dc2626{% endif %}">{{ pct(p.ann_ret) }}</td>
+          <td style="font-weight:700;color:{% if p.ann_ret >= params.rfr %}#16a34a{% elif p.ann_ret >= 0 %}#d97706{% else %}#dc2626{% endif %}">{{ pct(p.ann_ret) }}</td>
+          <td style="font-weight:700;color:{% if p.post_tax_ann and p.post_tax_ann >= 0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.post_tax_ann) }}</td>
           <td>{% if p.spread_pct is not none %}{{ "%.2f"|format(p.spread_pct) }}%{% else %}—{% endif %}</td>
+          <td style="font-weight:600;{% if p.lots_possible >= 5 %}color:#16a34a{% elif p.lots_possible >= 1 %}color:#d97706{% else %}color:#dc2626{% endif %}">
+            {% if p.lots_possible > 0 %}{{ p.lots_possible }} lots{% else %}<span class="na">0 — insufficient capital</span>{% endif %}
+          </td>
+          <td style="font-weight:700;color:{% if p.total_pnl and p.total_pnl >= 0 %}#16a34a{% else %}#dc2626{% endif %}">
+            {% if p.total_pnl is not none %}{{ inr(p.total_pnl) }}{% else %}<span class="na">—</span>{% endif %}
+          </td>
           <td>
             {% if p.signal == 'execute' %}<span class="pill pg">✅ EXECUTE</span>
             {% elif p.signal == 'borderline' %}<span class="pill pa">⚠ BORDERLINE</span>
@@ -525,7 +651,7 @@ tr:hover td{background:#f8fafc}
         </tr>
         {% endfor %}
       {% else %}
-        <tr><td colspan="18"><div class="empty">{% if not authenticated %}Login at /admin to load data{% elif not active %}Select an expiry above{% else %}No complete pairs for this expiry{% endif %}</div></td></tr>
+        <tr><td colspan="21"><div class="empty">{% if not authenticated %}Login at /admin{% elif not active %}Select an expiry{% else %}No pairs match this filter{% endif %}</div></td></tr>
       {% endif %}
       </tbody>
     </table>
