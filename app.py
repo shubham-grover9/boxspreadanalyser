@@ -151,31 +151,38 @@ def fetch_one(fyers, raw_expiry):
     try:
         resp = fyers.optionchain(data={
             "symbol": "NSE:NIFTY50-INDEX",
-            "strikecount": "25",
+            "strikecount": "",
             "timestamp": str(raw_expiry),
         })
         if resp.get("s") != "ok":
             return {"error": resp.get("message", "API error"), "chain": [], "pairs": [], "cmp": None}
         opt = resp.get("data", {})
-        cmp = opt.get("ltp")
+        # ltp is on the index row inside optionsChain where option_type == ""
+        cmp = None
         chain_dict = {}
         for row in opt.get("optionsChain", []):
-            k = row.get("strikePrice")
-            if k is None: continue
+            ot = row.get("option_type", "")
+            k = row.get("strike_price")
+            # Index row (option_type="" and strike_price=-1) has the underlying ltp
+            if ot == "" and (k is None or k == -1):
+                if cmp is None:
+                    cmp = row.get("ltp")
+                continue
+            if k is None or k <= 0:
+                continue
             if k not in chain_dict:
                 chain_dict[k] = {"k": k, "cb": None, "ca": None, "pb": None, "pa": None,
                                   "civ": None, "piv": None, "coi": None, "poi": None}
-            ot = row.get("option_type")
             if ot == "CE":
-                chain_dict[k]["cb"] = row.get("bid_price")
-                chain_dict[k]["ca"] = row.get("ask_price")
-                chain_dict[k]["civ"] = row.get("iv")
-                chain_dict[k]["coi"] = row.get("oi")
+                chain_dict[k]["cb"] = row.get("bid") or None
+                chain_dict[k]["ca"] = row.get("ask") or None
+                chain_dict[k]["civ"] = row.get("iv") or None
+                chain_dict[k]["coi"] = row.get("oi") or None
             elif ot == "PE":
-                chain_dict[k]["pb"] = row.get("bid_price")
-                chain_dict[k]["pa"] = row.get("ask_price")
-                chain_dict[k]["piv"] = row.get("iv")
-                chain_dict[k]["poi"] = row.get("oi")
+                chain_dict[k]["pb"] = row.get("bid") or None
+                chain_dict[k]["pa"] = row.get("ask") or None
+                chain_dict[k]["piv"] = row.get("iv") or None
+                chain_dict[k]["poi"] = row.get("oi") or None
         chain = sorted(chain_dict.values(), key=lambda x: x["k"])
         dte = expiry_dte(raw_expiry)
         pairs = []
