@@ -583,6 +583,22 @@ def inject_state():
         sd[exp] = {"arb_count": sum(1 for p in d.get("pairs", []) if p["signal"] == "execute")}
     return {"state_data": sd, "state": state}
 
+
+@app.route("/debug")
+def debug():
+    out = {"expiries": state["expiries"], "global_error": state["global_error"],
+           "last_fetch": state["last_fetch"], "authenticated": is_authenticated()}
+    for exp, d in state["data"].items():
+        out[exp] = {
+            "error": d.get("error"),
+            "cmp": d.get("cmp"),
+            "dte": d.get("dte"),
+            "chain_len": len(d.get("chain", [])),
+            "pairs_len": len(d.get("pairs", [])),
+            "first_chain": d.get("chain", [])[:2],
+        }
+    return jsonify(out)
+
 startup()
 
 if __name__ == "__main__":
