@@ -358,23 +358,23 @@ def fetch_one(fyers, raw_expiry):
         if resp.get("s") != "ok":
             return {"error": resp.get("message", "API error"), "chain": [], "pairs": [], "cmp": None, "dte": None}
 
-        opt = resp.get("data", {})
-        cmp = None
-        chain_dict = {}
-        chain_sym_map = {}  # k -> {ce_sym, pe_sym}
+        opt  = resp.get("data", {})
+        cmp  = None
+        chain_dict   = {}
+        chain_sym_map = {}
 
         for row in opt.get("optionsChain", []):
             ot = row.get("option_type", "")
             k  = row.get("strike_price")
             if ot == "" and (k is None or k == -1):
-                if cmp is None:
-                    cmp = row.get("ltp")
+                if cmp is None: cmp = row.get("ltp")
                 continue
-            if k is None or k <= 0:
-                continue
+            if k is None or k <= 0: continue
             if k not in chain_dict:
-                chain_dict[k] = {"k": k, "cb": None, "ca": None, "pb": None, "pa": None,
-                                  "civ": None, "piv": None, "coi": None, "poi": None,
+                chain_dict[k] = {"k": k, "cb": None, "ca": None,
+                                  "pb": None, "pa": None,
+                                  "civ": None, "piv": None,
+                                  "coi": None, "poi": None,
                                   "ce_sym": None, "pe_sym": None}
             if ot == "CE":
                 chain_dict[k]["cb"]     = row.get("bid") or None
@@ -389,90 +389,124 @@ def fetch_one(fyers, raw_expiry):
                 chain_dict[k]["poi"]    = row.get("oi")  or None
                 chain_dict[k]["pe_sym"] = row.get("symbol")
 
-        # Build chain_sym_map for depth lookups
         for k, s in chain_dict.items():
             chain_sym_map[k] = {"ce_sym": s.get("ce_sym"), "pe_sym": s.get("pe_sym")}
 
         chain = sorted(chain_dict.values(), key=lambda x: x["k"])
         dte   = expiry_dte(raw_expiry)
 
-        # Compute all pairs
+        # ── STAGE 1: PRE-FILTER before O(N²) pair computation ────────────────
+        # Only keep strikes that are genuinely tradeable:
+        #   1. Both call AND put must have non-zero bid AND ask (active quote)
+        #   2. Both call AND put OI must be >= MIN_OI_FILTER contracts
+        MIN_OI   = int(os.environ.get("MIN_OI_FILTER", "500"))
+        MAX_WIDTH = int(os.environ.get("MAX_BOX_WIDTH", "5000"))
+
+        def strike_ok(s):
+            # Active quotes on both sides
+            if not (s.get("cb") and s.get("ca") and s.get("pb") and s.get("pa")):
+                return False
+            # Minimum OI on both call and put
+            coi = s.get("coi") or 0
+            poi = s.get("poi") or 0
+            if coi < MIN_OI or poi < MIN_OI:
+                return False
+            return True
+
+        liquid_chain = [s for s in chain if strike_ok(s)]
+
+        # ── STAGE 1: PAIR COMPUTATION (only liquid strikes, limited width) ────
         pairs = []
-        for i in range(len(chain)):
-            for j in range(i + 1, len(chain)):
-                r = calc_pair(chain[i], chain[j], dte)
+        for i in range(len(liquid_chain)):
+            for j in range(i + 1, len(liquid_chain)):
+                s1, s2 = liquid_chain[i], liquid_chain[j]
+                if (s2["k"] - s1["k"]) > MAX_WIDTH:
+                    break  # chain is sorted, no point checking wider
+                r = calc_pair(s1, s2, dte)
                 if r:
                     r["dte_val"] = dte
                     pairs.append(r)
-        pairs.sort(key=lambda x: x.get("adj_ann_ret") or x["ann_ret"], reverse=True)
 
-        # Depth + impact for top 20 arb/borderline candidates only
-        top = [p for p in pairs if p["signal"] in ("execute", "borderline")][:20]
-        if top and fyers:
-            # Collect symbols from chain_sym_map (actual Fyers symbols from API)
-            syms_needed = set()
-            for p in top:
+        # Initial sort by raw ann_ret (depth not yet computed)
+        pairs.sort(key=lambda x: x["ann_ret"], reverse=True)
+
+        # ── STAGE 2: BATCH DEPTH FETCH FOR ALL CANDIDATE PAIRS ───────────────
+        # Fetch depth for ALL pairs that passed Stage 1 (not just top 20)
+        # Fyers depth API accepts up to 20 symbols per call — batch accordingly
+        candidates = [p for p in pairs if p["signal"] in ("execute", "borderline")]
+
+        if candidates and fyers:
+            # Collect all unique symbols needed
+            all_syms = set()
+            for p in candidates:
                 for k in [p["k1"], p["k2"]]:
                     sm = chain_sym_map.get(k, {})
-                    if sm.get("ce_sym"): syms_needed.add(sm["ce_sym"])
-                    if sm.get("pe_sym"): syms_needed.add(sm["pe_sym"])
+                    if sm.get("ce_sym"): all_syms.add(sm["ce_sym"])
+                    if sm.get("pe_sym"): all_syms.add(sm["pe_sym"])
 
-            try:
-                dr = fyers.depth(data={"symbol": list(syms_needed)[:20], "ohlcv_flag": 0})
-                depth_map = dr.get("d", {}) if dr.get("s") == "ok" else {}
-            except Exception:
-                depth_map = {}
+            # Batch into groups of 20 and fetch
+            sym_list  = list(all_syms)
+            depth_map = {}
+            for i in range(0, len(sym_list), 20):
+                batch = sym_list[i:i+20]
+                try:
+                    dr = fyers.depth(data={"symbol": batch, "ohlcv_flag": 0})
+                    if dr.get("s") == "ok":
+                        depth_map.update(dr.get("d", {}))
+                    time.sleep(0.15)  # gentle rate limiting between batches
+                except Exception:
+                    pass
 
-            lots = PARAMS["lot_size"] * PARAMS["num_lots"]
-            desired_lots = PARAMS["num_lots"]
+            # ── STAGE 2: IMPACT COST + DEPTH CAPACITY FOR ALL CANDIDATES ─────
+            lots          = PARAMS["lot_size"] * PARAMS["num_lots"]
+            desired_lots  = PARAMS["num_lots"]
             baseline_slip = 4 * PARAMS["slip_per_leg"] * PARAMS["lot_size"] * PARAMS["num_lots"]
 
-            for p in top:
+            for p in candidates:
                 s1 = chain_sym_map.get(p["k1"], {})
                 s2 = chain_sym_map.get(p["k2"], {})
                 legs = [
-                    (s1.get("ce_sym",""), "buy"),
-                    (s2.get("ce_sym",""), "sell"),
-                    (s2.get("pe_sym",""), "buy"),
-                    (s1.get("pe_sym",""), "sell"),
+                    (s1.get("ce_sym", ""), "buy"),
+                    (s2.get("ce_sym", ""), "sell"),
+                    (s2.get("pe_sym", ""), "buy"),
+                    (s1.get("pe_sym", ""), "sell"),
                 ]
 
-                # If any leg has no depth → non-executable
+                # All 4 legs must have depth — otherwise mark non-executable
                 caps = []
                 all_have_depth = True
                 for sym, dirn in legs:
                     if not sym:
-                        all_have_depth = False
-                        break
+                        all_have_depth = False; break
                     c = depth_capacity(depth_map, sym, dirn, slippage_pct=0.5)
                     if c is None:
-                        all_have_depth = False
-                        break
+                        all_have_depth = False; break
                     caps.append(c)
 
                 if not all_have_depth:
-                    p["impact_cost"] = None
-                    p["ic_flag"]     = "⚫ Incomplete depth"
-                    p["adj_net_pnl"] = None
-                    p["signal"]      = "borderline"
-                    p["signal_basis"]= "no_depth"
+                    p["impact_cost"]  = None
+                    p["ic_flag"]      = "⚫ Incomplete depth"
+                    p["adj_net_pnl"]  = None
+                    p["signal"]       = "borderline"
+                    p["signal_basis"] = "no_depth"
                     continue
 
-                # Depth capacity
+                # Depth capacity — bottleneck is weakest leg
                 depth_lots = min(caps)
                 p["depth_capacity"] = depth_lots
                 if depth_lots == 0:
                     p["oi_flag"] = "⛔ No depth"
                     p["oi_note"] = "Zero lots fillable within 0.5% slippage"
+                    p["signal"]  = "borderline"
                 elif desired_lots > depth_lots:
                     p["oi_flag"] = f"🔴 Depth limit: {depth_lots} lots"
                     p["oi_note"] = f"Book absorbs {depth_lots} lots (you want {desired_lots})"
                     p["depth_capped_lots"] = depth_lots
                 else:
                     p["oi_flag"] = f"🟢 Depth OK: {depth_lots} lots"
-                    p["oi_note"] = f"Book can absorb {desired_lots} lots within 0.5% slippage"
+                    p["oi_note"] = f"Book absorbs {desired_lots} lots within 0.5% slippage"
 
-                # Impact cost
+                # Impact cost — walk order book for all 4 legs
                 ic = calc_impact_cost(depth_map,
                     s1.get("ce_sym",""), "buy",  lots,
                     s2.get("ce_sym",""), "sell", lots,
@@ -482,7 +516,7 @@ def fetch_one(fyers, raw_expiry):
                 p["impact_cost"] = ic["total_impact"]
                 p["ic_flag"]     = ic["flag"]
 
-                # Adjusted P&L (subtract only incremental impact above baseline slippage)
+                # Adjusted P&L — subtract only incremental impact above baseline
                 if ic["total_impact"] is not None:
                     incremental = max(0, ic["total_impact"] - baseline_slip)
                     adj = round(p["net_pnl"] - incremental, 0)
@@ -490,9 +524,10 @@ def fetch_one(fyers, raw_expiry):
                     adj = None
                 p["adj_net_pnl"] = adj
 
-                # Rescore signal using adjusted P&L
+                # Rescore signal on adjusted P&L (the realistic number)
                 if adj is not None:
-                    adj_ann = (adj / p["net_debit"] * 100 * 365 / max(1, p.get("dte_val", 90))) if p["net_debit"] else 0
+                    adj_ann = (adj / p["net_debit"] * 100 * 365 /
+                               max(1, p.get("dte_val", 90))) if p["net_debit"] else 0
                     p["adj_ann_ret"] = round(adj_ann, 2)
                     if adj <= 0 or depth_lots == 0:
                         p["signal"]       = "loss"
@@ -503,7 +538,23 @@ def fetch_one(fyers, raw_expiry):
                     else:
                         p["signal_basis"] = "adj"
 
-        return {"error": None, "chain": chain, "pairs": pairs, "cmp": cmp, "dte": dte}
+        # Final sort by adj_ann_ret where available (realistic), else raw ann_ret
+        pairs.sort(
+            key=lambda x: x.get("adj_ann_ret") if x.get("adj_ann_ret") is not None else x["ann_ret"],
+            reverse=True
+        )
+
+        return {
+            "error": None, "chain": chain, "pairs": pairs,
+            "cmp": cmp, "dte": dte,
+            "pre_filter_stats": {
+                "total_strikes": len(chain),
+                "liquid_strikes": len(liquid_chain),
+                "total_pairs": len(pairs),
+                "candidates_with_depth": len(candidates),
+                "depth_batches": max(1, len(all_syms if candidates and fyers else []) // 20 + 1),
+            }
+        }
     except Exception as e:
         return {"error": str(e), "chain": [], "pairs": [], "cmp": None, "dte": None}
 
@@ -566,6 +617,7 @@ def index():
     active = request.args.get("expiry") or (state["expiries"][0] if state["expiries"] else None)
     d = state["data"].get(active, {}) if active else {}
     all_pairs = d.get("pairs", [])
+    pre_stats = d.get("pre_filter_stats", {})
     sig_filter = request.args.get("sig", "all")
     # Tax bracket
     try:
@@ -702,6 +754,9 @@ def index():
         tax_rate=tax_rate,
         capital=capital,
         hold_to_expiry=hold_to_expiry,
+        pre_stats=pre_stats,
+        min_oi=int(os.environ.get("MIN_OI_FILTER","500")),
+        max_width=int(os.environ.get("MAX_BOX_WIDTH","5000")),
         refresh_sec=REFRESH_SEC,
     )
 
@@ -976,10 +1031,19 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
 
 <!-- SCORECARD -->
 <div class="cards">
-  <div class="card"><div class="cl">Complete Pairs</div><div class="cv b">{{ total }}</div></div>
+  <div class="card"><div class="cl">Liquid Strikes</div>
+    <div class="cv b">{{ pre_stats.get('liquid_strikes','—') }}</div>
+    <div style="font-size:10px;color:#94a3b8;margin-top:2px">of {{ pre_stats.get('total_strikes','—') }} total · OI≥{{ min_oi }}, quotes active</div>
+  </div>
+  <div class="card"><div class="cl">Pairs Computed</div>
+    <div class="cv b">{{ total }}</div>
+    <div style="font-size:10px;color:#94a3b8;margin-top:2px">width ≤ {{ "{:,}".format(max_width) }} pts</div>
+  </div>
+  <div class="card"><div class="cl">Depth Evaluated</div>
+    <div class="cv b">{{ pre_stats.get('candidates_with_depth','—') }}</div>
+    <div style="font-size:10px;color:#94a3b8;margin-top:2px">all arb/borderline pairs</div>
+  </div>
   <div class="card"><div class="cl">✅ Execute</div><div class="cv g">{{ arb }}</div></div>
-  <div class="card"><div class="cl">⚠ Borderline</div><div class="cv a">{{ bord }}</div></div>
-  <div class="card"><div class="cl">❌ Loss</div><div class="cv r">{{ loss }}</div></div>
   <div class="card"><div class="cl">Best P&L/lot</div><div class="cv g" style="font-size:14px">{{ inr(best) }}</div></div>
   <div class="card"><div class="cl">Max Ann. Return</div><div class="cv g" style="font-size:14px">{{ pct(maxann) }}</div></div>
 </div>
@@ -1028,9 +1092,10 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
           <div class="sc-note">{% if hold_to_expiry %}The most common reason is Settlement STT (0.125% of box value) which is always charged when holding to expiry. Deep ITM boxes with high Entry STT on sell legs are also frequent losers.{% else %}In early exit mode, Settlement STT is avoided — but you pay the bid-ask spread cost to unwind all 4 legs. Pairs that were previously loss-making may now show a profit.{% endif %}</div>
         </div>
         <div class="signal-card impact">
-          <div class="sc-title">📊 Impact Cost Layer (on top of Signal)</div>
-          <div class="sc-rule">🟢 OK: &lt;1% of OI &nbsp; 🟡 Caution: 1–5% &nbsp; 🔴 High Risk: 5–15% &nbsp; ⛔ Avoid: &gt;15%</div>
-          <div class="sc-note">Even a valid Execute signal may be unfeasible if your capital is large relative to the open interest on the weakest leg. A 🔴 flag means your own order will move the market against you before you finish filling.</div>
+          <div class="sc-title">📊 Two-Stage Filter</div>
+          <div class="sc-rule">Stage 1: OI ≥ {{ min_oi }} contracts · Width ≤ {{ "{:,}".format(max_width) }} pts · Active quotes on all 4 legs</div>
+          <div class="sc-rule">Stage 2: Full order-book depth fetched for ALL remaining pairs → impact cost → adj P&L → signal rescore</div>
+          <div class="sc-note">Stage 1 removes illiquid and impractically wide pairs before any calculation. Stage 2 then evaluates real execution feasibility for every survivor — not just the top 20. Final sort is by impact-adjusted return, not theoretical return.</div>
         </div>
       </div>
     </div>
@@ -1296,6 +1361,14 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
          "Minimum annualized return for EXECUTE signal. Set above the RFR to ensure true outperformance.",
          "Filters borderline pairs that technically profit but don't beat a simple fixed deposit.",
          "Used in: Signal = EXECUTE if Ann% ≥ Min Ann% AND spread < Max Spread%. Otherwise BORDERLINE."),
+        ("Min OI per Strike", min_oi|string ~ " contracts", False,
+         "Minimum open interest required on both the call AND put side of a strike before it's included in pair analysis.",
+         "Strikes with very low OI have almost no real liquidity — high OI is the minimum bar for a tradeable strike.",
+         "Used in Stage 1 pre-filter: any strike where Call OI < " ~ min_oi|string ~ " or Put OI < " ~ min_oi|string ~ " is excluded before pair computation."),
+        ("Max Box Width", "{:,}".format(max_width) ~ " pts", False,
+         "Maximum allowed distance between K1 and K2 strikes. Pairs wider than this are not computed.",
+         "Very wide boxes have enormous settlement STT and net debit — almost never profitable. Limiting width keeps the list focused.",
+         "Used in Stage 1 pre-filter: only pairs where K2 − K1 ≤ " ~ "{:,}".format(max_width) ~ " are computed."),
         ("Max Bid-Ask Spread %", params.max_spread_pct|string ~ "%", False,
          "Maximum allowable bid-ask spread (total across 4 legs, as % of box width). Measures execution feasibility.",
          "Wide spreads mean the theoretical arb may vanish when you try to execute at real market prices.",
