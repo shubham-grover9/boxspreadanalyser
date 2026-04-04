@@ -395,25 +395,27 @@ def fetch_one(fyers, raw_expiry):
         chain = sorted(chain_dict.values(), key=lambda x: x["k"])
         dte   = expiry_dte(raw_expiry)
 
-        # ── STAGE 1: PRE-FILTER before O(N²) pair computation ────────────────
-        # Only keep strikes that are genuinely tradeable:
-        #   1. Both call AND put must have non-zero bid AND ask (active quote)
-        #   2. Both call AND put OI must be >= MIN_OI_FILTER contracts
-        MIN_OI   = int(os.environ.get("MIN_OI_FILTER", "500"))
-        MAX_WIDTH = int(os.environ.get("MAX_BOX_WIDTH", "5000"))
+        # ── STAGE 1: PRE-FILTER ──────────────────────────────────────────────
+        # Layer 1: Active quotes — both bid AND ask non-zero on all 4 legs
+        # Layer 2: Top N strikes by combined OI (call OI + put OI)
+        #          Adapts automatically — works for near and far expiries
+        # Layer 3: Max box width — skip pairs wider than MAX_WIDTH pts
+        MAX_WIDTH    = int(os.environ.get("MAX_BOX_WIDTH", "3000"))
+        TOP_STRIKES  = int(os.environ.get("TOP_STRIKES", "20"))
 
-        def strike_ok(s):
-            # Active quotes on both sides
-            if not (s.get("cb") and s.get("ca") and s.get("pb") and s.get("pa")):
-                return False
-            # Minimum OI on both call and put
-            coi = s.get("coi") or 0
-            poi = s.get("poi") or 0
-            if coi < MIN_OI or poi < MIN_OI:
-                return False
-            return True
+        # Layer 1: active quotes only
+        active_chain = [s for s in chain
+                        if s.get("cb") and s.get("ca")
+                        and s.get("pb") and s.get("pa")]
 
-        liquid_chain = [s for s in chain if strike_ok(s)]
+        # Layer 2: rank by combined OI, take top N
+        def combined_oi(s):
+            return (s.get("coi") or 0) + (s.get("poi") or 0)
+
+        active_chain.sort(key=combined_oi, reverse=True)
+        top_strikes  = active_chain[:TOP_STRIKES]
+        # Re-sort by strike price for pair computation
+        liquid_chain = sorted(top_strikes, key=lambda x: x["k"])
 
         # ── STAGE 1: PAIR COMPUTATION (only liquid strikes, limited width) ────
         pairs = []
@@ -548,11 +550,11 @@ def fetch_one(fyers, raw_expiry):
             "error": None, "chain": chain, "pairs": pairs,
             "cmp": cmp, "dte": dte,
             "pre_filter_stats": {
-                "total_strikes": len(chain),
+                "total_strikes":  len(chain),
+                "active_strikes": len(active_chain) if 'active_chain' in dir() else 0,
                 "liquid_strikes": len(liquid_chain),
-                "total_pairs": len(pairs),
-                "candidates_with_depth": len(candidates),
-                "depth_batches": max(1, len(all_syms if candidates and fyers else []) // 20 + 1),
+                "total_pairs":    len(pairs),
+                "candidates_with_depth": len(candidates) if 'candidates' in dir() else 0,
             }
         }
     except Exception as e:
@@ -1031,9 +1033,9 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
 
 <!-- SCORECARD -->
 <div class="cards">
-  <div class="card"><div class="cl">Liquid Strikes</div>
+  <div class="card"><div class="cl">Strikes Used</div>
     <div class="cv b">{{ pre_stats.get('liquid_strikes','—') }}</div>
-    <div style="font-size:10px;color:#94a3b8;margin-top:2px">of {{ pre_stats.get('total_strikes','—') }} total · OI≥{{ min_oi }}, quotes active</div>
+    <div style="font-size:10px;color:#94a3b8;margin-top:2px">top {{ top_strikes }} by OI · of {{ pre_stats.get('total_strikes','—') }} total</div>
   </div>
   <div class="card"><div class="cl">Pairs Computed</div>
     <div class="cv b">{{ total }}</div>
@@ -1361,10 +1363,10 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
          "Minimum annualized return for EXECUTE signal. Set above the RFR to ensure true outperformance.",
          "Filters borderline pairs that technically profit but don't beat a simple fixed deposit.",
          "Used in: Signal = EXECUTE if Ann% ≥ Min Ann% AND spread < Max Spread%. Otherwise BORDERLINE."),
-        ("Min OI per Strike", min_oi|string ~ " contracts", False,
-         "Minimum open interest required on both the call AND put side of a strike before it's included in pair analysis.",
-         "Strikes with very low OI have almost no real liquidity — high OI is the minimum bar for a tradeable strike.",
-         "Used in Stage 1 pre-filter: any strike where Call OI < " ~ min_oi|string ~ " or Put OI < " ~ min_oi|string ~ " is excluded before pair computation."),
+        ("Top Strikes by OI", top_strikes|string ~ " strikes", False,
+         "Only the top N strikes ranked by combined Open Interest (call OI + put OI) are used for pair analysis.",
+         "Concentrates analysis on the most liquid, actively traded strikes. Adapts automatically — works for near-expiry (low OI) and far-expiry (high OI) contracts alike.",
+         "Used in Stage 1 pre-filter: all strikes ranked by (Call OI + Put OI), top " ~ top_strikes|string ~ " selected. Active quote check (non-zero bid AND ask) applied first."),
         ("Max Box Width", "{:,}".format(max_width) ~ " pts", False,
          "Maximum allowed distance between K1 and K2 strikes. Pairs wider than this are not computed.",
          "Very wide boxes have enormous settlement STT and net debit — almost never profitable. Limiting width keeps the list focused.",
