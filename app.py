@@ -243,15 +243,16 @@ def fetch_one(fyers, raw_expiry):
             "timestamp": str(raw_expiry),
         })
         if resp.get("s") != "ok":
-            return {"error": resp.get("message", "API error"), "chain": [], "pairs": [], "cmp": None}
+            return {"error": resp.get("message", "API error"), "chain": [], "pairs": [], "cmp": None, "dte": None}
+
         opt = resp.get("data", {})
-        # ltp is on the index row inside optionsChain where option_type == ""
         cmp = None
         chain_dict = {}
+        chain_sym_map = {}  # k -> {ce_sym, pe_sym}
+
         for row in opt.get("optionsChain", []):
             ot = row.get("option_type", "")
-            k = row.get("strike_price")
-            # Index row (option_type="" and strike_price=-1) has the underlying ltp
+            k  = row.get("strike_price")
             if ot == "" and (k is None or k == -1):
                 if cmp is None:
                     cmp = row.get("ltp")
@@ -260,106 +261,139 @@ def fetch_one(fyers, raw_expiry):
                 continue
             if k not in chain_dict:
                 chain_dict[k] = {"k": k, "cb": None, "ca": None, "pb": None, "pa": None,
-                                  "civ": None, "piv": None, "coi": None, "poi": None}
+                                  "civ": None, "piv": None, "coi": None, "poi": None,
+                                  "ce_sym": None, "pe_sym": None}
             if ot == "CE":
-                chain_dict[k]["cb"] = row.get("bid") or None
-                chain_dict[k]["ca"] = row.get("ask") or None
-                chain_dict[k]["civ"] = row.get("iv") or None
-                chain_dict[k]["coi"] = row.get("oi") or None
+                chain_dict[k]["cb"]     = row.get("bid") or None
+                chain_dict[k]["ca"]     = row.get("ask") or None
+                chain_dict[k]["civ"]    = row.get("iv")  or None
+                chain_dict[k]["coi"]    = row.get("oi")  or None
+                chain_dict[k]["ce_sym"] = row.get("symbol")
             elif ot == "PE":
-                chain_dict[k]["pb"] = row.get("bid") or None
-                chain_dict[k]["pa"] = row.get("ask") or None
-                chain_dict[k]["piv"] = row.get("iv") or None
-                chain_dict[k]["poi"] = row.get("oi") or None
+                chain_dict[k]["pb"]     = row.get("bid") or None
+                chain_dict[k]["pa"]     = row.get("ask") or None
+                chain_dict[k]["piv"]    = row.get("iv")  or None
+                chain_dict[k]["poi"]    = row.get("oi")  or None
+                chain_dict[k]["pe_sym"] = row.get("symbol")
+
+        # Build chain_sym_map for depth lookups
+        for k, s in chain_dict.items():
+            chain_sym_map[k] = {"ce_sym": s.get("ce_sym"), "pe_sym": s.get("pe_sym")}
+
         chain = sorted(chain_dict.values(), key=lambda x: x["k"])
-        dte = expiry_dte(raw_expiry)
+        dte   = expiry_dte(raw_expiry)
+
+        # Compute all pairs
         pairs = []
         for i in range(len(chain)):
             for j in range(i + 1, len(chain)):
                 r = calc_pair(chain[i], chain[j], dte)
-                if r: pairs.append(r)
-        for pair in pairs:
-            pair["dte_val"] = dte  # store for post-impact rescore
-        pairs.sort(key=lambda x: x.get("adj_ann_ret") if x.get("adj_ann_ret") is not None else x["ann_ret"], reverse=True)
-        # Fetch depth for top 20 candidates only (rate limit friendly)
-        top_candidates = [p for p in pairs if p["signal"] in ("execute","borderline")][:20]
-        if top_candidates and fyers:
-            symbols_needed = set()
-            for p in top_candidates:
-                # Build Fyers option symbols for the 4 legs
-                # Fyers format: NSE:NIFTY{YY}{MON}{STRIKE}{TYPE} e.g. NSE:NIFTY26JUN25000CE
-                disp = expiry_display(raw_expiry)  # e.g. "30-Jun-2026"
-                try:
-                    from datetime import datetime as _dt
-                    _d = _dt.strptime(disp, "%d-%b-%Y")
-                    exp_str = _d.strftime("%y%b").upper()  # e.g. "26JUN"
-                except Exception:
-                    exp_str = disp.upper().replace("-","")
-                symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k1'])}CE")
-                symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k2'])}CE")
-                symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k1'])}PE")
-                symbols_needed.add(f"NSE:NIFTY{exp_str}{int(p['k2'])}PE")
+                if r:
+                    r["dte_val"] = dte
+                    pairs.append(r)
+        pairs.sort(key=lambda x: x.get("adj_ann_ret") or x["ann_ret"], reverse=True)
+
+        # Depth + impact for top 20 arb/borderline candidates only
+        top = [p for p in pairs if p["signal"] in ("execute", "borderline")][:20]
+        if top and fyers:
+            # Collect symbols from chain_sym_map (actual Fyers symbols from API)
+            syms_needed = set()
+            for p in top:
+                for k in [p["k1"], p["k2"]]:
+                    sm = chain_sym_map.get(k, {})
+                    if sm.get("ce_sym"): syms_needed.add(sm["ce_sym"])
+                    if sm.get("pe_sym"): syms_needed.add(sm["pe_sym"])
+
             try:
-                depth_resp = fyers.depth(data={"symbol": list(symbols_needed)[:20], "ohlcv_flag": 0})
-                depth_map = depth_resp.get("d", {}) if depth_resp.get("s") == "ok" else {}
+                dr = fyers.depth(data={"symbol": list(syms_needed)[:20], "ohlcv_flag": 0})
+                depth_map = dr.get("d", {}) if dr.get("s") == "ok" else {}
             except Exception:
                 depth_map = {}
-            # Add impact cost to top candidates
+
             lots = PARAMS["lot_size"] * PARAMS["num_lots"]
-            for p in top_candidates:
+            desired_lots = PARAMS["num_lots"]
+            baseline_slip = 4 * PARAMS["slip_per_leg"] * PARAMS["lot_size"] * PARAMS["num_lots"]
+
+            for p in top:
                 s1 = chain_sym_map.get(p["k1"], {})
                 s2 = chain_sym_map.get(p["k2"], {})
-                ic = calc_impact_cost(
-                    depth_map,
-                    s1.get("ce_sym",""), "buy",  lots,  # Buy Call K1
-                    s2.get("ce_sym",""), "sell", lots,  # Sell Call K2
-                    s2.get("pe_sym",""), "buy",  lots,  # Buy Put K2
-                    s1.get("pe_sym",""), "sell", lots,  # Sell Put K1
+                legs = [
+                    (s1.get("ce_sym",""), "buy"),
+                    (s2.get("ce_sym",""), "sell"),
+                    (s2.get("pe_sym",""), "buy"),
+                    (s1.get("pe_sym",""), "sell"),
+                ]
+
+                # If any leg has no depth → non-executable
+                caps = []
+                all_have_depth = True
+                for sym, dirn in legs:
+                    if not sym:
+                        all_have_depth = False
+                        break
+                    c = depth_capacity(depth_map, sym, dirn, slippage_pct=0.5)
+                    if c is None:
+                        all_have_depth = False
+                        break
+                    caps.append(c)
+
+                if not all_have_depth:
+                    p["impact_cost"] = None
+                    p["ic_flag"]     = "⚫ Incomplete depth"
+                    p["adj_net_pnl"] = None
+                    p["signal"]      = "borderline"
+                    p["signal_basis"]= "no_depth"
+                    continue
+
+                # Depth capacity
+                depth_lots = min(caps)
+                p["depth_capacity"] = depth_lots
+                if depth_lots == 0:
+                    p["oi_flag"] = "⛔ No depth"
+                    p["oi_note"] = "Zero lots fillable within 0.5% slippage"
+                elif desired_lots > depth_lots:
+                    p["oi_flag"] = f"🔴 Depth limit: {depth_lots} lots"
+                    p["oi_note"] = f"Book absorbs {depth_lots} lots (you want {desired_lots})"
+                    p["depth_capped_lots"] = depth_lots
+                else:
+                    p["oi_flag"] = f"🟢 Depth OK: {depth_lots} lots"
+                    p["oi_note"] = f"Book can absorb {desired_lots} lots within 0.5% slippage"
+
+                # Impact cost
+                ic = calc_impact_cost(depth_map,
+                    s1.get("ce_sym",""), "buy",  lots,
+                    s2.get("ce_sym",""), "sell", lots,
+                    s2.get("pe_sym",""), "buy",  lots,
+                    s1.get("pe_sym",""), "sell", lots,
                 )
                 p["impact_cost"] = ic["total_impact"]
-                p["ic_pct"]      = ic["impact_pct"]
                 p["ic_flag"]     = ic["flag"]
-                # FIX 3: Depth-based capacity — how many lots within 0.5% of mid?
-                caps = []
-                for sym, dirn in [
-                    (s1.get("ce_sym",""), "buy"), (s2.get("ce_sym",""), "sell"),
-                    (s2.get("pe_sym",""), "buy"), (s1.get("pe_sym",""), "sell")
-                ]:
-                    if sym:
-                        c = depth_capacity(depth_map, sym, dirn, slippage_pct=0.5)
-                        if c is not None:
-                            caps.append(c)
-                if caps:
-                    depth_lots = min(caps)  # bottleneck = min across 4 legs
-                    p["depth_capacity"] = depth_lots
-                    if depth_lots == 0:
-                        p["oi_flag"] = "⛔ No depth"
-                        p["oi_note"] = "Zero fillable lots within 0.5% slippage on at least one leg"
-                    elif lots_possible > depth_lots:
-                        p["oi_flag"] = f"🔴 Depth limit: {depth_lots} lots"
-                        p["oi_note"] = f"Book can only absorb {depth_lots} lots within 0.5% slippage — you want {lots_possible}"
-                        p["lots_possible"] = depth_lots  # cap to what's actually executable
-                    else:
-                        p["oi_flag"] = f"🟢 Depth OK: {depth_lots} lots"
-                        p["oi_note"] = f"Book can absorb {depth_lots} lots within 0.5% slippage"
-                # Adjusted P&L = net P&L minus actual impact cost
-                adj = round(p["net_pnl"] - ic["total_impact"], 0) if ic["total_impact"] is not None else None
+
+                # Adjusted P&L (subtract only incremental impact above baseline slippage)
+                if ic["total_impact"] is not None:
+                    incremental = max(0, ic["total_impact"] - baseline_slip)
+                    adj = round(p["net_pnl"] - incremental, 0)
+                else:
+                    adj = None
                 p["adj_net_pnl"] = adj
-                # FIX 1: Rescore signal using adjusted P&L (the realistic number)
+
+                # Rescore signal using adjusted P&L
                 if adj is not None:
                     adj_ann = (adj / p["net_debit"] * 100 * 365 / max(1, p.get("dte_val", 90))) if p["net_debit"] else 0
                     p["adj_ann_ret"] = round(adj_ann, 2)
-                    if adj <= 0:
-                        p["signal"] = "loss"
+                    if adj <= 0 or depth_lots == 0:
+                        p["signal"]       = "loss"
                         p["signal_basis"] = "adj"
                     elif adj_ann < PARAMS["min_ann_ret"]:
-                        p["signal"] = "borderline"
+                        p["signal"]       = "borderline"
                         p["signal_basis"] = "adj"
                     else:
-                        p["signal_basis"] = "adj"  # signal stays execute but now confirmed by adj P&L
+                        p["signal_basis"] = "adj"
+
         return {"error": None, "chain": chain, "pairs": pairs, "cmp": cmp, "dte": dte}
     except Exception as e:
         return {"error": str(e), "chain": [], "pairs": [], "cmp": None, "dte": None}
+
 
 def fetch_all():
     token = load_token()
