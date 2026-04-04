@@ -2,6 +2,118 @@ import os, json, time, threading, hashlib, secrets
 from datetime import datetime, date
 from flask import Flask, render_template_string, request, redirect, jsonify, session, url_for
 
+# ── DATABASE (Railway Postgres) ───────────────────────────────────────────────
+def get_db():
+    try:
+        import psycopg2
+        url = os.environ.get("DATABASE_URL","")
+        if not url: return None
+        return psycopg2.connect(url, sslmode="require")
+    except Exception as e:
+        print(f"DB connect: {e}"); return None
+
+def init_db():
+    conn = get_db()
+    if not conn:
+        print("⚠ No DATABASE_URL — history disabled"); return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS opportunities (
+                    id            SERIAL PRIMARY KEY,
+                    logged_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expiry        TEXT,
+                    k1            INTEGER, k2 INTEGER, box_w INTEGER, dte INTEGER,
+                    ca1 NUMERIC, cb2 NUMERIC, pa2 NUMERIC, pb1 NUMERIC,
+                    net_debit NUMERIC, box_value NUMERIC,
+                    entry_stt NUMERIC, settl_stt NUMERIC, other_costs NUMERIC,
+                    net_pnl NUMERIC, ann_ret NUMERIC,
+                    adj_net_pnl NUMERIC, adj_ann_ret NUMERIC,
+                    spread_pct NUMERIC, impact_cost NUMERIC,
+                    exec_difficulty TEXT, oi_flag TEXT,
+                    signal TEXT, signal_basis TEXT,
+                    hold_to_expiry BOOLEAN DEFAULT TRUE,
+                    logic_snapshot JSONB
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_opp_time ON opportunities(logged_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_opp_pair ON opportunities(expiry,k1,k2)")
+        conn.commit()
+        print("✓ DB ready")
+    except Exception as e:
+        print(f"DB init error: {e}")
+    finally:
+        conn.close()
+
+def log_opportunities(execute_pairs, expiry, hold_to_expiry=True):
+    """Log all Execute-signal pairs to DB with full logic snapshot."""
+    if not execute_pairs: return
+    conn = get_db()
+    if not conn: return
+    try:
+        snapshot = {k: v for k,v in PARAMS.items() if k != "hold_to_expiry"}
+        import json as _json
+        snap_json = _json.dumps(snapshot)
+        with conn.cursor() as cur:
+            for p in execute_pairs:
+                cur.execute("""
+                    INSERT INTO opportunities (
+                        expiry,k1,k2,box_w,dte,
+                        ca1,cb2,pa2,pb1,
+                        net_debit,box_value,entry_stt,settl_stt,other_costs,
+                        net_pnl,ann_ret,adj_net_pnl,adj_ann_ret,
+                        spread_pct,impact_cost,exec_difficulty,oi_flag,
+                        signal,signal_basis,hold_to_expiry,logic_snapshot
+                    ) VALUES (
+                        %s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,
+                        %s,%s,%s,%s,
+                        %s,%s,%s,%s
+                    )""", (
+                    expiry, p.get("k1"), p.get("k2"), p.get("box_w"), p.get("dte_val"),
+                    p.get("ca1"), p.get("cb2"), p.get("pa2"), p.get("pb1"),
+                    p.get("net_debit"), p.get("box_value"),
+                    p.get("entry_stt"), p.get("settl_stt"), p.get("other_costs"),
+                    p.get("net_pnl"), p.get("ann_ret"),
+                    p.get("adj_net_pnl"), p.get("adj_ann_ret"),
+                    p.get("spread_pct"), p.get("impact_cost"),
+                    p.get("exec_difficulty"), p.get("oi_flag"),
+                    p.get("signal"), p.get("signal_basis"),
+                    hold_to_expiry, snap_json
+                ))
+        conn.commit()
+    except Exception as e:
+        print(f"DB log error: {e}")
+    finally:
+        conn.close()
+
+def get_history(limit=200):
+    """Fetch recent opportunity history from DB."""
+    conn = get_db()
+    if not conn: return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, logged_at, expiry, k1, k2, box_w, dte,
+                       ca1, cb2, pa2, pb1,
+                       net_debit, box_value, entry_stt, settl_stt, other_costs,
+                       net_pnl, ann_ret, adj_net_pnl, adj_ann_ret,
+                       spread_pct, impact_cost, exec_difficulty, oi_flag,
+                       signal, signal_basis, hold_to_expiry, logic_snapshot
+                FROM opportunities
+                ORDER BY logged_at DESC
+                LIMIT %s
+            """, (limit,))
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+    except Exception as e:
+        print(f"DB fetch error: {e}"); return []
+    finally:
+        conn.close()
+
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
 
@@ -23,8 +135,9 @@ PARAMS = {
     "stamp_pct":      float(os.environ.get("STAMP_PCT", "0.003")),
     "slip_per_leg":   float(os.environ.get("SLIP_PER_LEG", "0.5")),
     "rfr":            float(os.environ.get("RFR", "6.5")),
-    "min_ann_ret":    float(os.environ.get("MIN_ANN_RET", "1.0")),
+    "min_ann_ret":    float(os.environ.get("MIN_ANN_RET", "12.0")),
     "max_spread_pct": float(os.environ.get("MAX_SPREAD_PCT", "1.0")),
+    "hold_to_expiry": True,  # toggled per-request, not an env var
 }
 
 state = {
@@ -414,7 +527,13 @@ def fetch_all():
         state["global_error"] = None
         for disp in displays:
             raw = state["raw_map"][disp]
-            state["data"][disp] = fetch_one(fyers, raw)
+            result = fetch_one(fyers, raw)
+            state["data"][disp] = result
+            # Log any execute signals to DB
+            exec_pairs = [p for p in result.get("pairs",[]) if p.get("signal") == "execute"]
+            if exec_pairs:
+                threading.Thread(target=log_opportunities,
+                    args=(exec_pairs, disp, True), daemon=True).start()
             time.sleep(0.4)
         state["last_fetch"] = datetime.now().strftime("%H:%M:%S")
     except Exception as e:
@@ -458,6 +577,7 @@ def index():
         capital = float(request.args.get("capital", "300000"))
     except Exception:
         capital = 300000.0
+    hold_to_expiry = request.args.get("hold", "1") != "0"
     # Filter pairs
     pairs = all_pairs if sig_filter == "all" else [p for p in all_pairs if p["signal"] == sig_filter]
     arb  = sum(1 for p in all_pairs if p["signal"] == "execute")
@@ -470,7 +590,18 @@ def index():
     chain_by_k = {s["k"]: s for s in d.get("chain", [])}
     for p in pairs:
         lots_possible = int(capital // p["net_debit"]) if p["net_debit"] > 0 else 0
-        total_pnl     = p["net_pnl"] * lots_possible if lots_possible > 0 else None
+
+        # If not holding to expiry: settlement STT = 0, but add back bid-ask exit cost estimate
+        # Exit cost ≈ spread_pct% of box value (cost to unwind all 4 legs at market)
+        if not hold_to_expiry and p.get("settl_stt", 0):
+            exit_cost = (p.get("spread_pct", 0) or 0) / 100 * p["box_value"]
+            adj_pnl_hte = round(p["net_pnl"] + p["settl_stt"] - exit_cost, 0)
+            adj_ann_hte = round((adj_pnl_hte / p["net_debit"] * 100 * 365 / max(1, d.get("dte",90))) if p["net_debit"] else 0, 2)
+        else:
+            adj_pnl_hte = None
+            adj_ann_hte = None
+
+        total_pnl = p["net_pnl"] * lots_possible if lots_possible > 0 else None
         post_tax_ann  = p["ann_ret"] * (1 - tax_rate / 100) if p["ann_ret"] is not None else None
         adj_total_pnl = (p.get("adj_net_pnl", p["net_pnl"]) or p["net_pnl"]) * lots_possible if lots_possible > 0 else None
 
@@ -524,6 +655,23 @@ def index():
         if p.get("ca1",0) == 0 or p.get("pb1",0) == 0 or p.get("cb2",0) == 0 or p.get("pa2",0) == 0:
             stale_flag = "⚠ Suspect — zero quote on a leg"
 
+        # Effective P&L: use early-exit adjusted if not holding to expiry
+        effective_pnl = adj_pnl_hte if (not hold_to_expiry and adj_pnl_hte is not None) else p["net_pnl"]
+        effective_ann = adj_ann_hte if (not hold_to_expiry and adj_ann_hte is not None) else p["ann_ret"]
+
+        # Rescore signal for early exit scenario
+        if not hold_to_expiry and adj_pnl_hte is not None:
+            if adj_pnl_hte <= 0:
+                hte_signal = "loss"
+            elif adj_ann_hte < PARAMS["min_ann_ret"]:
+                hte_signal = "borderline"
+            elif (p.get("spread_pct") or 99) < PARAMS["max_spread_pct"]:
+                hte_signal = "execute"
+            else:
+                hte_signal = "borderline"
+        else:
+            hte_signal = p["signal"]
+
         enriched.append({**p,
             "lots_possible": lots_possible,
             "total_pnl":     round(total_pnl, 0) if total_pnl is not None else None,
@@ -533,6 +681,12 @@ def index():
             "oi_note": oi_note, "bottleneck_oi": bottleneck_oi,
             "exec_difficulty": exec_difficulty,
             "stale_flag": stale_flag,
+            "adj_pnl_hte":  adj_pnl_hte,
+            "adj_ann_hte":  adj_ann_hte,
+            "effective_pnl": effective_pnl,
+            "effective_ann": effective_ann,
+            "hte_signal":   hte_signal,
+            "hold_to_expiry": hold_to_expiry,
         })
     return render_template_string(PAGE,
         expiries=state["expiries"], active=active,
@@ -547,6 +701,7 @@ def index():
         sig_filter=sig_filter,
         tax_rate=tax_rate,
         capital=capital,
+        hold_to_expiry=hold_to_expiry,
         refresh_sec=REFRESH_SEC,
     )
 
@@ -645,6 +800,12 @@ def calc():
         net_pnl=net_pnl, ret_pct=ret_pct, ann_ret=ann_ret,
         params=p, has_input=has_input, inr=inr, pct=pct,
     )
+
+
+@app.route("/history")
+def history():
+    rows = get_history(limit=500)
+    return render_template_string(HISTORY_PAGE, rows=rows, inr=inr, pct=pct)
 
 
 @app.route("/admin", methods=["GET", "POST"])
@@ -788,7 +949,7 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
   <div>
     <div class="t1">NIFTY Box Spread Arbitrage Scanner</div>
     <div class="t2">
-      {% if active %}{{ active }} &nbsp;·&nbsp; DTE: {{ d.get('dte','?') }} &nbsp;·&nbsp; CMP: ₹{{ "{:,.0f}".format(d.get('cmp',0) or 0) }} &nbsp;·&nbsp; Lot: {{ params.lot_size }} &nbsp;·&nbsp; Capital: ₹{{ "{:,.0f}".format(capital) }} &nbsp;·&nbsp; Tax: {{ tax_rate|int }}%{% endif %}
+      {% if active %}{{ active }} &nbsp;·&nbsp; DTE: {{ d.get('dte','?') }} &nbsp;·&nbsp; CMP: ₹{{ "{:,.0f}".format(d.get('cmp',0) or 0) }} &nbsp;·&nbsp; Lot: {{ params.lot_size }} &nbsp;·&nbsp; Capital: ₹{{ "{:,.0f}".format(capital) }} &nbsp;·&nbsp; Tax: {{ tax_rate|int }}% &nbsp;·&nbsp; {% if hold_to_expiry %}Hold to expiry{% else %}Early exit mode{% endif %}{% endif %}
     </div>
   </div>
   <div class="live"><div class="dot"></div>
@@ -853,18 +1014,18 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
       <div style="display:flex;flex-direction:column;gap:10px">
         <div class="signal-card exec">
           <div class="sc-title">✅ EXECUTE</div>
-          <div class="sc-rule">Net P&L > 0 AND Ann. Return ≥ {{ params.min_ann_ret }}% AND Spread% &lt; {{ params.max_spread_pct }}%</div>
+          <div class="sc-rule">Profit after all costs &gt; 0 · Yearly return ≥ {{ params.min_ann_ret }}% · Buy/sell price gap &lt; {{ params.max_spread_pct }}% of spread width</div>
           <div class="sc-note">All 3 conditions must be met. Annualized return must beat the minimum threshold (set above the {{ params.rfr }}% risk-free rate). Bid-ask spread must be tight enough that execution is feasible at quoted prices.</div>
         </div>
         <div class="signal-card border">
           <div class="sc-title">⚠ BORDERLINE</div>
-          <div class="sc-rule">Net P&L > 0 BUT Ann. Return &lt; {{ params.min_ann_ret }}% OR Spread% ≥ {{ params.max_spread_pct }}%</div>
-          <div class="sc-note">Profitable on paper but either doesn't beat the hurdle rate, or the bid-ask spread risk is too high. Worth monitoring — may become Execute if prices shift slightly.</div>
+          <div class="sc-rule">Profit &gt; 0 BUT yearly return &lt; {{ params.min_ann_ret }}% OR buy/sell gap too wide to execute reliably</div>
+          <div class="sc-note">Makes a profit after all costs, but either the yearly return is below {{ params.min_ann_ret }}% (not worth it vs a fixed deposit), or the gap between buy and sell prices is too wide to reliably execute at the quoted price. Worth monitoring — a small price shift can push it to Execute.</div>
         </div>
         <div class="signal-card avoid">
           <div class="sc-title">❌ AVOID</div>
           <div class="sc-rule">Net P&L ≤ 0 after ALL costs including settlement STT</div>
-          <div class="sc-note">The most common reason is Settlement STT (0.125% of box value) which is always charged. Deep ITM boxes with high Entry STT on sell legs are also frequent losers.</div>
+          <div class="sc-note">{% if hold_to_expiry %}The most common reason is Settlement STT (0.125% of box value) which is always charged when holding to expiry. Deep ITM boxes with high Entry STT on sell legs are also frequent losers.{% else %}In early exit mode, Settlement STT is avoided — but you pay the bid-ask spread cost to unwind all 4 legs. Pairs that were previously loss-making may now show a profit.{% endif %}</div>
         </div>
         <div class="signal-card impact">
           <div class="sc-title">📊 Impact Cost Layer (on top of Signal)</div>
@@ -906,6 +1067,16 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
           <option value="loss" {% if sig_filter=='loss' %}selected{% endif %}>❌ Loss — avoid ({{ loss }})</option>
         </select>
       </div>
+      <div class="ctrl-group">
+        <label class="ctrl-label">Hold to Expiry?</label>
+        <select name="hold" class="ctrl-input" style="width:220px">
+          <option value="1" {% if hold_to_expiry %}selected{% endif %}>Yes — hold till expiry date</option>
+          <option value="0" {% if not hold_to_expiry %}selected{% endif %}>No — close before expiry</option>
+        </select>
+        <span style="font-size:10px;color:#94a3b8;margin-top:2px">
+          {% if hold_to_expiry %}Settlement STT (0.125%) applies at expiry{% else %}Settlement STT avoided — exit cost estimated from spread width{% endif %}
+        </span>
+      </div>
       <button type="submit" class="ctrl-btn">Apply →</button>
       <div style="margin-left:auto;font-size:11px;color:#94a3b8;align-self:flex-end;text-align:right">
         <a href="/calc" style="color:#3b82f6">Step-by-step calculator →</a>
@@ -919,7 +1090,7 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
 <div class="sec" style="border-left:4px solid #16a34a">
   <div class="sh sh-static" style="background:#f0fdf4">
     <span style="color:#15803d">✅ {{ arb }} Executable Spread{{ 's' if arb > 1 else '' }} Found — {{ active }}</span>
-    <span style="font-size:11px;color:#15803d;font-weight:400">All conditions met: P&L > 0, Ann% ≥ {{ params.min_ann_ret }}%, Spread% &lt; {{ params.max_spread_pct }}%</span>
+    <span style="font-size:11px;color:#15803d;font-weight:400">Profitable after all costs, yearly return ≥ {{ params.min_ann_ret }}%, and buy/sell price gap is tight enough to execute</span>
   </div>
   <div class="sb" style="background:#f0fdf4">
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px">
@@ -957,9 +1128,9 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
         <strong>Why executable:</strong>
         Box settles at ₹{{ "{:,}".format(p.box_value|int) }}. You pay ₹{{ "{:,}".format(p.net_debit|int) }} net debit.
         After all costs (Entry STT {{ inr(p.entry_stt) }} + Settl STT {{ inr(p.settl_stt) }} + other {{ inr(p.other_costs) }}),
-        net profit is {{ inr(p.net_pnl) }}/lot = {{ pct(p.ann_ret) }} annualised over {{ d.get('dte','?') }} days.
+        net profit is {{ inr(p.net_pnl) }}/lot = {{ pct(p.ann_ret) }} per year (over {{ d.get('dte','?') }} days to expiry).
         {% if p.ann_ret >= params.rfr %}Beats the {{ params.rfr }}% risk-free rate by {{ "%.2f"|format(p.ann_ret - params.rfr) }}%.{% endif %}
-        {% if p.spread_pct is not none %}Bid-ask spread {{ "%.2f"|format(p.spread_pct) }}% is below the {{ params.max_spread_pct }}% threshold.{% endif %}
+        {% if p.spread_pct is not none %}The gap between buy and sell prices ({{ "%.2f"|format(p.spread_pct) }}%) is tight enough to execute reliably.{% endif %}
       </div>
       <div style="margin-top:6px;font-size:11px">
         <strong>Liquidity:</strong> {{ p.get('oi_flag','—') }}
@@ -978,8 +1149,8 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
     </div>
     {% if bord > 0 %}
     <div style="margin-top:12px;padding:10px 12px;background:#fefce8;border:1px solid #fde68a;border-radius:6px;font-size:12px;color:#854d0e">
-      <strong>⚠ {{ bord }} borderline pairs</strong> are profitable but either don't beat the {{ params.min_ann_ret }}% hurdle rate or have bid-ask spread > {{ params.max_spread_pct }}%.
-      Switch to the <a href="/?expiry={{ active }}&sig=borderline&tax={{ tax_rate }}&capital={{ capital|int }}" style="color:#854d0e;font-weight:700">Borderline filter</a> to review them — some may be worth executing if your hurdle rate is lower.
+      <strong>⚠ {{ bord }} borderline pairs</strong> make a profit but either return less than {{ params.min_ann_ret }}% per year (barely better than a fixed deposit) or have wide buy/sell price gaps that make execution uncertain.
+      Switch to the <a href="/?expiry={{ active }}&sig=borderline&tax={{ tax_rate }}&capital={{ capital|int }}" style="color:#854d0e;font-weight:700">Borderline filter</a> to review them — some may be worth executing if you're comfortable with a lower yearly return than {{ params.min_ann_ret }}%.
     </div>
     {% endif %}
   </div>
@@ -991,10 +1162,10 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
   </div>
   <div class="sb">
     <div style="font-size:12px;color:#374151;line-height:1.8">
-      <strong>{{ bord }} borderline pairs</strong> are profitable but below the {{ params.min_ann_ret }}% annualised hurdle. 
+      <strong>{{ bord }} pairs are profitable</strong> but return less than {{ params.min_ann_ret }}% per year after all costs. 
       <strong>{{ loss }} pairs</strong> show net losses — most due to Settlement STT (0.125% × box value) wiping the edge.<br>
       <strong>Try:</strong> switching to a longer-dated expiry (more time = more premium inefficiency to exploit), 
-      or lowering the Min Ann. Return threshold in Analysis Controls if your hurdle rate is lower than {{ params.min_ann_ret }}%.
+      or reducing the <strong>Min Ann. Return</strong> in Analysis Controls above — that setting filters out pairs below a minimum yearly return. Lowering it from {{ params.min_ann_ret }}% will show more results.
     </div>
   </div>
 </div>
@@ -1208,7 +1379,9 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
         <th class="group-a">C Ask(K1)</th><th class="group-a">C Bid(K2)</th><th class="group-a">P Ask(K2)</th><th class="group-a">P Bid(K1)</th>
         <th class="group-b">Net Debit</th><th class="group-b">Box Value</th>
         <th class="group-b">Entry STT</th><th class="group-b">Settl STT</th><th class="group-b">Other Costs</th>
-        <th class="group-c">Net P&L/lot</th><th class="group-c">Return%</th><th class="group-c">Ann.%</th><th class="group-c">Post-Tax Ann%</th>
+        <th class="group-c">Net P&L/lot</th>
+        {% if not hold_to_expiry %}<th class="group-c" title="P&L after closing early — settlement STT saved, exit spread cost deducted">Early Exit P&L</th>{% endif %}
+        <th class="group-c">Return%</th><th class="group-c">Ann.%</th><th class="group-c">Post-Tax Ann%</th>
         <th class="group-c">Spread%</th>
         <th class="group-d">Impact Cost</th><th class="group-d">Adj P&L</th>
         <th class="group-e">Max Lots</th><th class="group-e">Total P&L deployed</th>
@@ -1228,6 +1401,9 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
           <td>{{ inr(p.net_debit) }}</td><td>{{ inr(p.box_value) }}</td>
           <td>{{ inr(p.entry_stt) }}</td><td>{{ inr(p.settl_stt) }}</td><td>{{ inr(p.other_costs) }}</td>
           <td style="font-weight:700;color:{% if p.net_pnl>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(p.net_pnl) }}</td>
+          {% if not p.get('hold_to_expiry', True) and p.get('adj_pnl_hte') is not none %}
+          <td style="font-weight:700;color:{% if p.adj_pnl_hte>=0 %}#16a34a{% else %}#dc2626{% endif %}" title="P&L if closed before expiry (no settlement STT, includes exit spread cost)">{{ inr(p.adj_pnl_hte) }} <span style="font-size:9px;color:#64748b">early exit</span></td>
+          {% endif %}
           <td style="color:{% if p.ret_pct>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.ret_pct) }}</td>
           <td style="font-weight:700;color:{% if p.ann_ret>=params.rfr %}#16a34a{% elif p.ann_ret>=0 %}#d97706{% else %}#dc2626{% endif %}">{{ pct(p.ann_ret) }}</td>
           <td style="color:{% if p.post_tax_ann and p.post_tax_ann>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.post_tax_ann) }}</td>
@@ -1251,10 +1427,11 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
           <td title="{{ p.get('exec_difficulty','') }}">{{ p.get('exec_difficulty','—') }}
             {% if p.get('stale_flag') %}<br><span style="font-size:9px;color:#dc2626">{{ p.stale_flag }}</span>{% endif %}
           </td>
+          {% set display_signal = p.get('hte_signal', p.signal) %}
           <td>
-            {% if p.signal=='execute' %}
+            {% if display_signal=='execute' %}
               <span class="pill pg">✅ EXECUTE{% if p.get('signal_basis')=='adj' %} (adj){% endif %}</span>
-            {% elif p.signal=='borderline' %}
+            {% elif display_signal=='borderline' %}
               <span class="pill pa">⚠ BORDERLINE{% if p.get('signal_basis')=='adj' %} (adj){% endif %}</span>
             {% else %}
               <span class="pill pr">❌ AVOID</span>
@@ -1271,7 +1448,7 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
 
 <div style="text-align:center;font-size:11px;color:#94a3b8;padding-bottom:20px">
   Live data via Fyers API v3 &nbsp;·&nbsp; NSE European-style cash-settled index options &nbsp;·&nbsp; Not financial advice &nbsp;·&nbsp;
-  Page auto-refreshes every {{ refresh_sec }}s &nbsp;·&nbsp; <a href="/calc" style="color:#3b82f6">Step-by-step calculator</a>
+  Page auto-refreshes every {{ refresh_sec }}s &nbsp;·&nbsp; <a href="/calc" style="color:#3b82f6">Step-by-step calculator</a> &nbsp;·&nbsp; <a href="/history" style="color:#3b82f6">Opportunity history</a>
 </div>
 </div>
 </body></html>"""
@@ -1328,7 +1505,7 @@ a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
     <div class="t1">Box Spread Step-by-Step Calculator</div>
     <div class="t2">Enter any 4 prices manually — every calculation shown transparently</div>
   </div>
-  <a href="/" style="color:#94a3b8;font-size:12px">← Back to scanner</a>
+  <div style="display:flex;gap:16px"><a href="/" style="color:#94a3b8;font-size:12px">← Back to scanner</a><a href="/history" style="color:#94a3b8;font-size:12px">History →</a></div>
 </div>
 
 <div class="main">
@@ -1524,6 +1701,149 @@ a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
 
 </div></body></html>"""
 
+HISTORY_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opportunity History — NIFTY Box Spread</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;background:#f0f2f5;color:#1a1a1a}
+.topbar{background:#0f172a;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.t1{font-size:15px;font-weight:700;color:#f8fafc}
+.t2{font-size:11px;color:#94a3b8;margin-top:2px}
+.main{padding:16px 20px;max-width:1600px;margin:0 auto}
+.sec{background:#fff;border-radius:9px;box-shadow:0 1px 2px rgba(0,0,0,.06);margin-bottom:14px;overflow:hidden}
+.sh{padding:10px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:13px;display:flex;justify-content:space-between;align-items:center}
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+th{background:#f1f5f9;padding:7px 10px;text-align:right;font-size:10px;color:#475569;font-weight:700;border-bottom:2px solid #e2e8f0;white-space:nowrap;text-transform:uppercase;letter-spacing:.3px}
+th.l{text-align:left}
+td{padding:6px 10px;border-bottom:1px solid #f1f5f9;text-align:right;font-family:'Courier New',monospace;white-space:nowrap;vertical-align:top}
+td.l{text-align:left;font-family:inherit}
+tr:hover td{background:#f8fafc}
+.pill{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:700}
+.pg{background:#dcfce7;color:#15803d}.pa{background:#fef3c7;color:#92400e}.pr{background:#fee2e2;color:#b91c1c}
+.logic{font-size:10px;color:#64748b;line-height:1.6;font-family:'Courier New',monospace;background:#f8fafc;padding:4px 6px;border-radius:4px;max-width:280px;white-space:pre-wrap}
+.na{color:#cbd5e1}
+.empty{text-align:center;padding:48px;color:#94a3b8}
+.badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;margin-left:4px}
+.badge-new{background:#dbeafe;color:#1e40af}
+.badge-adj{background:#fef3c7;color:#92400e}
+.filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.fi{padding:5px 10px;border:1px solid #e2e8f0;border-radius:5px;background:#fff;font-size:12px;font-family:inherit}
+</style>
+<script>
+function filterTable(){
+  var exp = document.getElementById('fExp').value.toLowerCase();
+  var sig = document.getElementById('fSig').value;
+  var rows = document.querySelectorAll('tbody tr');
+  rows.forEach(function(r){
+    var show = true;
+    if(exp && !r.dataset.expiry.includes(exp)) show=false;
+    if(sig && r.dataset.signal !== sig) show=false;
+    r.style.display = show?'':'none';
+  });
+}
+</script>
+</head>
+<body>
+<div class="topbar">
+  <div>
+    <div class="t1">Opportunity History</div>
+    <div class="t2">Every Execute signal logged with timestamp and assumptions in force at that moment</div>
+  </div>
+  <a href="/" style="color:#94a3b8;font-size:12px">← Live Scanner</a>
+</div>
+<div class="main">
+
+<div class="sec">
+  <div class="sh">
+    <span>{{ rows|length }} records</span>
+    <div class="filters">
+      <input id="fExp" class="fi" style="width:140px" placeholder="Filter expiry..." oninput="filterTable()">
+      <select id="fSig" class="fi" onchange="filterTable()">
+        <option value="">All signals</option>
+        <option value="execute">Execute</option>
+        <option value="borderline">Borderline</option>
+        <option value="loss">Loss</option>
+      </select>
+    </div>
+  </div>
+  <div class="tw">
+  <table>
+    <thead><tr>
+      <th class="l">Logged At (IST)</th>
+      <th class="l">Expiry</th>
+      <th>K1</th><th>K2</th><th>Width</th><th>DTE</th>
+      <th>C Ask(K1)</th><th>C Bid(K2)</th><th>P Ask(K2)</th><th>P Bid(K1)</th>
+      <th>Net Debit</th><th>Box Value</th>
+      <th>Entry STT</th><th>Settl STT</th><th>Other Costs</th>
+      <th>Net P&amp;L</th><th>Ann%</th>
+      <th>Adj P&amp;L</th><th>Adj Ann%</th>
+      <th>Spread%</th><th>Impact Cost</th>
+      <th>Exec</th><th>OI Flag</th>
+      <th>Signal</th>
+      <th class="l">Assumptions at time of signal</th>
+    </tr></thead>
+    <tbody>
+    {% if rows %}
+      {% for r in rows %}
+      {% set snap = r.logic_snapshot if r.logic_snapshot else {} %}
+      <tr data-expiry="{{ (r.expiry or '')|lower }}" data-signal="{{ r.signal or '' }}">
+        <td class="l" style="white-space:nowrap;font-family:monospace;font-size:11px">
+          {{ r.logged_at.strftime('%d %b %Y %H:%M:%S') if r.logged_at else '—' }}
+        </td>
+        <td class="l" style="font-weight:600">{{ r.expiry or '—' }}</td>
+        <td>{{ "{:,}".format(r.k1) if r.k1 else '—' }}</td>
+        <td>{{ "{:,}".format(r.k2) if r.k2 else '—' }}</td>
+        <td>{{ "{:,}".format(r.box_w) if r.box_w else '—' }}</td>
+        <td>{{ r.dte or '—' }}</td>
+        <td>{{ "%.2f"|format(r.ca1) if r.ca1 else '—' }}</td>
+        <td>{{ "%.2f"|format(r.cb2) if r.cb2 else '—' }}</td>
+        <td>{{ "%.2f"|format(r.pa2) if r.pa2 else '—' }}</td>
+        <td>{{ "%.2f"|format(r.pb1) if r.pb1 else '—' }}</td>
+        <td>{{ inr(r.net_debit) }}</td>
+        <td>{{ inr(r.box_value) }}</td>
+        <td>{{ inr(r.entry_stt) }}</td>
+        <td>{{ inr(r.settl_stt) }}</td>
+        <td>{{ inr(r.other_costs) }}</td>
+        <td style="font-weight:700;color:{% if r.net_pnl and r.net_pnl>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(r.net_pnl) }}</td>
+        <td style="color:{% if r.ann_ret and r.ann_ret>=12 %}#16a34a{% elif r.ann_ret and r.ann_ret>=0 %}#d97706{% else %}#dc2626{% endif %}">{{ pct(r.ann_ret|float if r.ann_ret else None) }}</td>
+        <td style="font-weight:700;color:{% if r.adj_net_pnl and r.adj_net_pnl>=0 %}#16a34a{% else %}#94a3b8{% endif %}">{{ inr(r.adj_net_pnl) if r.adj_net_pnl else '—' }}</td>
+        <td style="color:{% if r.adj_ann_ret and r.adj_ann_ret>=12 %}#16a34a{% elif r.adj_ann_ret and r.adj_ann_ret>=0 %}#d97706{% else %}#94a3b8{% endif %}">{{ pct(r.adj_ann_ret|float if r.adj_ann_ret else None) }}</td>
+        <td>{{ "%.2f"|format(r.spread_pct) ~ "%" if r.spread_pct else '—' }}</td>
+        <td style="color:{% if r.impact_cost and r.impact_cost>2000 %}#dc2626{% elif r.impact_cost and r.impact_cost>500 %}#d97706{% else %}#16a34a{% endif %}">{{ inr(r.impact_cost) if r.impact_cost else '—' }}</td>
+        <td>{{ r.exec_difficulty or '—' }}</td>
+        <td style="font-size:10px">{{ r.oi_flag or '—' }}</td>
+        <td>
+          {% if r.signal == 'execute' %}<span class="pill pg">✅ EXECUTE{% if r.signal_basis == 'adj' %}<span class="badge badge-adj">adj</span>{% endif %}</span>
+          {% elif r.signal == 'borderline' %}<span class="pill pa">⚠ BORDERLINE</span>
+          {% else %}<span class="pill pr">❌ AVOID</span>{% endif %}
+          {% if not r.hold_to_expiry %}<br><span class="badge badge-new">early exit</span>{% endif %}
+        </td>
+        <td class="l">
+          <div class="logic">Lot: {{ snap.get('lot_size','?') }} | Entry STT: {{ snap.get('stt_entry_pct','?') }}%
+Settl STT: {{ snap.get('stt_settl_pct','?') }}% | Min Ann: {{ snap.get('min_ann_ret','?') }}%
+Brokerage: ₹{{ snap.get('broker_per_leg','?') }}/leg | RFR: {{ snap.get('rfr','?') }}%
+Max Spread: {{ snap.get('max_spread_pct','?') }}% | Slip: {{ snap.get('slip_per_leg','?') }}pts</div>
+        </td>
+      </tr>
+      {% endfor %}
+    {% else %}
+      <tr><td colspan="25"><div class="empty">No history yet — Execute signals will appear here once the scanner finds them.</div></td></tr>
+    {% endif %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div style="text-align:center;font-size:11px;color:#94a3b8;padding-bottom:20px">
+  History stored in Railway Postgres · Survives redeploys · Assumptions column shows exact logic in force when each signal was logged
+</div>
+</div>
+</body></html>"""
+
 ADMIN_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Admin</title>
 <style>
@@ -1561,6 +1881,7 @@ input[type=password]{width:100%;padding:10px;border:1px solid #e2e8f0;border-rad
 </div></body></html>"""
 
 def startup():
+    init_db()
     if is_authenticated():
         print("Token found — fetching data")
         threading.Thread(target=fetch_all, daemon=True).start()
