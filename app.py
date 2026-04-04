@@ -15,7 +15,7 @@ PARAMS = {
     "lot_size":       int(os.environ.get("LOT_SIZE", "65")),
     "num_lots":       int(os.environ.get("NUM_LOTS", "1")),
     "broker_per_leg": float(os.environ.get("BROKER_PER_LEG", "20")),
-    "stt_entry_pct":  float(os.environ.get("STT_ENTRY_PCT", "0.05")),
+    "stt_entry_pct":  float(os.environ.get("STT_ENTRY_PCT", "0.10")),
     "stt_settl_pct":  float(os.environ.get("STT_SETTL_PCT", "0.125")),
     "txn_pct":        float(os.environ.get("TXN_PCT", "0.03503")),
     "sebi_pct":       float(os.environ.get("SEBI_PCT", "0.0001")),
@@ -120,10 +120,13 @@ def calc_pair(r1, r2, dte):
     estt = (p["stt_entry_pct"] / 100) * (cb2 + pb1) * lots
     sstt = (p["stt_settl_pct"] / 100) * bv
     tp = (ca1 + pa2 + cb2 + pb1) * lots
-    other = ((p["txn_pct"] / 100) * tp + (p["sebi_pct"] / 100) * tp +
-             4 * p["broker_per_leg"] * (1 + p["gst_pct"] / 100) +
-             (p["stamp_pct"] / 100) * (ca1 + pa2) * lots +
-             4 * p["slip_per_leg"] * lots)
+    txn_amt   = (p["txn_pct"]  / 100) * tp
+    sebi_amt  = (p["sebi_pct"] / 100) * tp
+    brok_amt  = 4 * p["broker_per_leg"]
+    gst_amt   = (p["gst_pct"]  / 100) * (brok_amt + txn_amt + sebi_amt)  # GST on brok+txn+SEBI per NISM
+    stamp_amt = (p["stamp_pct"] / 100) * (ca1 + pa2) * lots
+    slip_amt  = 4 * p["slip_per_leg"] * lots
+    other = txn_amt + sebi_amt + brok_amt + gst_amt + stamp_amt + slip_amt
     net = bv - nd - estt - sstt - other
     ret = (net / nd * 100) if nd else 0
     ann = (ret * 365 / dte) if dte else 0
@@ -145,7 +148,32 @@ def calc_pair(r1, r2, dte):
         "ret_pct": round(ret, 2), "ann_ret": round(ann, 2),
         "spread_pct": round(sp, 2) if sp is not None else None,
         "signal": sig,
+        # Dynamic slippage: scale with spread width and depth
+        "spread_slip": round((sp / 100 * box_w * PARAMS["lot_size"] * 0.5) if sp else 4 * PARAMS["slip_per_leg"] * PARAMS["lot_size"], 0),
     }
+
+def depth_capacity(depth_map, sym, direction, slippage_pct=0.5):
+    """How many lots can be filled within slippage_pct% of mid price?"""
+    d = depth_map.get(sym, {})
+    book = d.get("ask", []) if direction == "buy" else d.get("bids", [])
+    bid1 = (d.get("bids") or [{}])[0].get("price")
+    ask1 = (d.get("ask") or [{}])[0].get("price")
+    if not book or not bid1 or not ask1:
+        return None
+    mid = (bid1 + ask1) / 2
+    limit = mid * (1 + slippage_pct/100) if direction == "buy" else mid * (1 - slippage_pct/100)
+    fillable_units = 0
+    for level in book:
+        price = level.get("price", 0)
+        vol   = level.get("volume", 0)
+        within = price <= limit if direction == "buy" else price >= limit
+        if within:
+            fillable_units += vol
+        else:
+            break
+    lot_size = PARAMS["lot_size"]
+    return int(fillable_units / lot_size) if lot_size else 0
+
 
 def calc_impact_cost(depth_map, sym_ca, dir_ca, qty_ca, sym_cb, dir_cb, qty_cb,
                      sym_pa, dir_pa, qty_pa, sym_pb, dir_pb, qty_pb):
@@ -250,7 +278,9 @@ def fetch_one(fyers, raw_expiry):
             for j in range(i + 1, len(chain)):
                 r = calc_pair(chain[i], chain[j], dte)
                 if r: pairs.append(r)
-        pairs.sort(key=lambda x: x["ann_ret"], reverse=True)
+        for pair in pairs:
+            pair["dte_val"] = dte  # store for post-impact rescore
+        pairs.sort(key=lambda x: x.get("adj_ann_ret") if x.get("adj_ann_ret") is not None else x["ann_ret"], reverse=True)
         # Fetch depth for top 20 candidates only (rate limit friendly)
         top_candidates = [p for p in pairs if p["signal"] in ("execute","borderline")][:20]
         if top_candidates and fyers:
@@ -277,24 +307,56 @@ def fetch_one(fyers, raw_expiry):
             # Add impact cost to top candidates
             lots = PARAMS["lot_size"] * PARAMS["num_lots"]
             for p in top_candidates:
-                disp2 = expiry_display(raw_expiry)
-                try:
-                    from datetime import datetime as _dt2
-                    _d2 = _dt2.strptime(disp2, "%d-%b-%Y")
-                    exp_str = _d2.strftime("%y%b").upper()
-                except Exception:
-                    exp_str = disp2.upper().replace("-","")
+                s1 = chain_sym_map.get(p["k1"], {})
+                s2 = chain_sym_map.get(p["k2"], {})
                 ic = calc_impact_cost(
                     depth_map,
-                    f"NSE:NIFTY{exp_str}{int(p['k1'])}CE", "buy",  lots,  # Buy Call K1
-                    f"NSE:NIFTY{exp_str}{int(p['k2'])}CE", "sell", lots,  # Sell Call K2
-                    f"NSE:NIFTY{exp_str}{int(p['k2'])}PE", "buy",  lots,  # Buy Put K2
-                    f"NSE:NIFTY{exp_str}{int(p['k1'])}PE", "sell", lots,  # Sell Put K1
+                    s1.get("ce_sym",""), "buy",  lots,  # Buy Call K1
+                    s2.get("ce_sym",""), "sell", lots,  # Sell Call K2
+                    s2.get("pe_sym",""), "buy",  lots,  # Buy Put K2
+                    s1.get("pe_sym",""), "sell", lots,  # Sell Put K1
                 )
-                p["impact_cost"]     = ic["total_impact"]
-                p["ic_pct"]          = ic["impact_pct"]
-                p["adj_net_pnl"]     = round(p["net_pnl"] - ic["total_impact"], 0) if ic["total_impact"] else None
-                p["ic_flag"]         = ic["flag"]
+                p["impact_cost"] = ic["total_impact"]
+                p["ic_pct"]      = ic["impact_pct"]
+                p["ic_flag"]     = ic["flag"]
+                # FIX 3: Depth-based capacity — how many lots within 0.5% of mid?
+                caps = []
+                for sym, dirn in [
+                    (s1.get("ce_sym",""), "buy"), (s2.get("ce_sym",""), "sell"),
+                    (s2.get("pe_sym",""), "buy"), (s1.get("pe_sym",""), "sell")
+                ]:
+                    if sym:
+                        c = depth_capacity(depth_map, sym, dirn, slippage_pct=0.5)
+                        if c is not None:
+                            caps.append(c)
+                if caps:
+                    depth_lots = min(caps)  # bottleneck = min across 4 legs
+                    p["depth_capacity"] = depth_lots
+                    if depth_lots == 0:
+                        p["oi_flag"] = "⛔ No depth"
+                        p["oi_note"] = "Zero fillable lots within 0.5% slippage on at least one leg"
+                    elif lots_possible > depth_lots:
+                        p["oi_flag"] = f"🔴 Depth limit: {depth_lots} lots"
+                        p["oi_note"] = f"Book can only absorb {depth_lots} lots within 0.5% slippage — you want {lots_possible}"
+                        p["lots_possible"] = depth_lots  # cap to what's actually executable
+                    else:
+                        p["oi_flag"] = f"🟢 Depth OK: {depth_lots} lots"
+                        p["oi_note"] = f"Book can absorb {depth_lots} lots within 0.5% slippage"
+                # Adjusted P&L = net P&L minus actual impact cost
+                adj = round(p["net_pnl"] - ic["total_impact"], 0) if ic["total_impact"] is not None else None
+                p["adj_net_pnl"] = adj
+                # FIX 1: Rescore signal using adjusted P&L (the realistic number)
+                if adj is not None:
+                    adj_ann = (adj / p["net_debit"] * 100 * 365 / max(1, p.get("dte_val", 90))) if p["net_debit"] else 0
+                    p["adj_ann_ret"] = round(adj_ann, 2)
+                    if adj <= 0:
+                        p["signal"] = "loss"
+                        p["signal_basis"] = "adj"
+                    elif adj_ann < PARAMS["min_ann_ret"]:
+                        p["signal"] = "borderline"
+                        p["signal_basis"] = "adj"
+                    else:
+                        p["signal_basis"] = "adj"  # signal stays execute but now confirmed by adj P&L
         return {"error": None, "chain": chain, "pairs": pairs, "cmp": cmp, "dte": dte}
     except Exception as e:
         return {"error": str(e), "chain": [], "pairs": [], "cmp": None, "dte": None}
@@ -378,39 +440,55 @@ def index():
         post_tax_ann  = p["ann_ret"] * (1 - tax_rate / 100) if p["ann_ret"] is not None else None
         adj_total_pnl = (p.get("adj_net_pnl", p["net_pnl"]) or p["net_pnl"]) * lots_possible if lots_possible > 0 else None
 
-        # OI liquidity: find bottleneck leg (min OI across 4 strikes)
+        # FIX 3: Depth-based capacity (better than OI)
+        # We'll populate this after depth data is available; for now use OI as fallback
         s1 = chain_by_k.get(p["k1"], {})
         s2 = chain_by_k.get(p["k2"], {})
         coi1 = s1.get("coi"); poi1 = s1.get("poi")
         coi2 = s2.get("coi"); poi2 = s2.get("poi")
-        # The 4 legs: Buy Call K1 (coi1), Sell Call K2 (coi2), Buy Put K2 (poi2), Sell Put K1 (poi1)
         leg_ois = [x for x in [coi1, coi2, poi2, poi1] if x is not None and x > 0]
-        bottleneck_oi = min(leg_ois) if leg_ois else None  # contracts
-        # OI in ₹ value: contracts × lot_size × mid_price_of_bottleneck_leg
-        # Simpler: use contracts × lot_size as proxy (conservative)
-        oi_flag = "⚫ No OI data"
-        oi_pct  = None
-        oi_note = None
+        bottleneck_oi = min(leg_ois) if leg_ois else None
+        oi_flag = "⚫ No OI data"; oi_pct = None; oi_note = None
         if bottleneck_oi and lots_possible > 0:
-            order_size_lots = lots_possible  # lots we want to trade
-            oi_in_lots = bottleneck_oi  # OI is already in contracts (each = 1 lot)
-            oi_pct = (order_size_lots / oi_in_lots * 100) if oi_in_lots > 0 else None
+            oi_pct = (lots_possible / bottleneck_oi * 100) if bottleneck_oi > 0 else None
             if oi_pct is not None:
                 if oi_pct < 1:
-                    oi_flag = "🟢 OK"
-                    oi_note = f"Your order is {oi_pct:.2f}% of bottleneck OI — minimal market impact"
+                    oi_flag = "🟢 OK (OI)"
+                    oi_note = f"{oi_pct:.2f}% of bottleneck OI — use depth check for precision"
                 elif oi_pct < 5:
-                    oi_flag = "🟡 Caution"
-                    oi_note = f"Your order is {oi_pct:.1f}% of bottleneck OI — may cause some price movement"
+                    oi_flag = "🟡 Caution (OI)"
+                    oi_note = f"{oi_pct:.1f}% of OI — depth may be thinner than OI suggests"
                 elif oi_pct < 15:
-                    oi_flag = "🔴 High Risk"
-                    oi_note = f"Your order is {oi_pct:.1f}% of OI — likely to move prices against you"
+                    oi_flag = "🔴 High Risk (OI)"
+                    oi_note = f"{oi_pct:.1f}% of OI — likely to move prices"
                 else:
-                    oi_flag = "⛔ Avoid"
-                    oi_note = f"Your order is {oi_pct:.1f}% of OI — will close the arb before you fill"
+                    oi_flag = "⛔ Avoid (OI)"
+                    oi_note = f"{oi_pct:.1f}% of OI — order will exhaust available liquidity"
         elif bottleneck_oi == 0:
-            oi_flag = "⛔ No liquidity"
-            oi_note = "OI is zero on at least one leg — cannot execute"
+            oi_flag = "⛔ No liquidity"; oi_note = "OI is zero on at least one leg"
+
+        # FIX 4: Execution difficulty score
+        sp_pct = p.get("spread_pct") or 999
+        ic_amt  = p.get("impact_cost") or 0
+        depth_c = p.get("depth_capacity")
+        exec_score = 0
+        if sp_pct < 0.3: exec_score += 2
+        elif sp_pct < 0.7: exec_score += 1
+        if ic_amt < 200: exec_score += 2
+        elif ic_amt < 1000: exec_score += 1
+        if depth_c is None: exec_score += 0
+        elif depth_c >= lots_possible: exec_score += 2
+        elif depth_c > 0: exec_score += 1
+        if   exec_score >= 5: exec_difficulty = "🟢 Easy"
+        elif exec_score >= 3: exec_difficulty = "🟡 Medium"
+        elif exec_score >= 1: exec_difficulty = "🔴 Hard"
+        else:                 exec_difficulty = "⛔ Very Hard"
+
+        # FIX 5: Quote staleness — flag if spread looks stale (zero volume proxy)
+        # We don't have last_trade_time from optionchain, but flag zero-bid as suspect
+        stale_flag = None
+        if p.get("ca1",0) == 0 or p.get("pb1",0) == 0 or p.get("cb2",0) == 0 or p.get("pa2",0) == 0:
+            stale_flag = "⚠ Suspect — zero quote on a leg"
 
         enriched.append({**p,
             "lots_possible": lots_possible,
@@ -418,8 +496,9 @@ def index():
             "adj_total_pnl": round(adj_total_pnl, 0) if adj_total_pnl is not None else None,
             "post_tax_ann":  round(post_tax_ann, 2) if post_tax_ann is not None else None,
             "oi_flag": oi_flag, "oi_pct": round(oi_pct, 2) if oi_pct else None,
-            "oi_note": oi_note,
-            "bottleneck_oi": bottleneck_oi,
+            "oi_note": oi_note, "bottleneck_oi": bottleneck_oi,
+            "exec_difficulty": exec_difficulty,
+            "stale_flag": stale_flag,
         })
     return render_template_string(PAGE,
         expiries=state["expiries"], active=active,
@@ -436,6 +515,44 @@ def index():
         capital=capital,
         refresh_sec=REFRESH_SEC,
     )
+
+@app.route("/depthtest")
+def depthtest():
+    token = load_token()
+    if not token:
+        return jsonify({"error": "No token"})
+    try:
+        from fyers_apiv3 import fyersModel
+        fyers = fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=token, log_path="")
+        # Test with a known liquid symbol - 28-Apr-2026 expiry, 25000 strike
+        test_syms = [
+            "NSE:NIFTY26APR25000CE",
+            "NSE:NIFTY26APR25000PE",
+            "NSE:NIFTY2642825000CE",   # alternative weekly format
+            "NSE:NIFTY25APR2500CE",    # another possible format
+        ]
+        results = {}
+        for sym in test_syms:
+            try:
+                r = fyers.depth(data={"symbol": [sym], "ohlcv_flag": 0})
+                results[sym] = {
+                    "s": r.get("s"),
+                    "message": r.get("message",""),
+                    "has_data": bool(r.get("d")),
+                    "keys": list(r.get("d", {}).keys())[:3],
+                }
+            except Exception as e:
+                results[sym] = {"error": str(e)}
+        # Also try quotes API to find correct symbol format
+        try:
+            q = fyers.quotes(data={"symbols": "NSE:NIFTY50-INDEX"})
+            results["_quotes_test"] = {"s": q.get("s"), "sample_key": list(q.get("d",{}).keys())[:2]}
+        except Exception as e:
+            results["_quotes_test"] = {"error": str(e)}
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({"exception": str(e)})
+
 
 @app.route("/calc")
 def calc():
@@ -801,6 +918,8 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
       </div>
       {% if p.lots_possible > 0 %}
       <div style="margin-top:8px;font-size:11px;color:#374151;line-height:1.6">
+        <strong>Signal basis:</strong> {% if p.get('signal_basis')=='adj' %}✅ Confirmed using <em>impact-adjusted</em> P&L{% else %}Based on raw P&L (impact cost not yet computed){% endif %}<br>
+        <strong>Execution:</strong> {{ p.get('exec_difficulty','—') }}<br>
         <strong>Why executable:</strong>
         Box settles at ₹{{ "{:,}".format(p.box_value|int) }}. You pay ₹{{ "{:,}".format(p.net_debit|int) }} net debit.
         After all costs (Entry STT {{ inr(p.entry_stt) }} + Settl STT {{ inr(p.settl_stt) }} + other {{ inr(p.other_costs) }}),
@@ -1060,6 +1179,7 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
         <th class="group-d">Impact Cost</th><th class="group-d">Adj P&L</th>
         <th class="group-e">Max Lots</th><th class="group-e">Total P&L deployed</th>
         <th class="group-e">OI Liquidity</th><th class="group-e">Bottleneck OI</th>
+        <th class="group-e">Exec Difficulty</th>
         <th>Signal</th>
       </tr></thead>
       <tbody>
@@ -1094,10 +1214,17 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
           <td style="color:#64748b">
             {% if p.get('bottleneck_oi') %}{{ "{:,}".format(p.bottleneck_oi|int) }} lots{% else %}<span class="na">—</span>{% endif %}
           </td>
+          <td title="{{ p.get('exec_difficulty','') }}">{{ p.get('exec_difficulty','—') }}
+            {% if p.get('stale_flag') %}<br><span style="font-size:9px;color:#dc2626">{{ p.stale_flag }}</span>{% endif %}
+          </td>
           <td>
-            {% if p.signal=='execute' %}<span class="pill pg">✅ EXECUTE</span>
-            {% elif p.signal=='borderline' %}<span class="pill pa">⚠ BORDERLINE</span>
-            {% else %}<span class="pill pr">❌ AVOID</span>{% endif %}
+            {% if p.signal=='execute' %}
+              <span class="pill pg">✅ EXECUTE{% if p.get('signal_basis')=='adj' %} (adj){% endif %}</span>
+            {% elif p.signal=='borderline' %}
+              <span class="pill pa">⚠ BORDERLINE{% if p.get('signal_basis')=='adj' %} (adj){% endif %}</span>
+            {% else %}
+              <span class="pill pr">❌ AVOID</span>
+            {% endif %}
           </td>
         </tr>
       {% endfor %}{% else %}
