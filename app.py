@@ -547,7 +547,7 @@ def fetch_one(fyers, raw_expiry):
         )
 
         return {
-            "error": None, "chain": chain, "pairs": pairs,
+            "error": None, "chain": chain, "liquid_chain": liquid_chain, "pairs": pairs,
             "cmp": cmp, "dte": dte,
             "pre_filter_stats": {
                 "total_strikes":  len(chain),
@@ -634,6 +634,9 @@ def index():
     hold_to_expiry = request.args.get("hold", "1") != "0"
     # Filter pairs
     pairs = all_pairs if sig_filter == "all" else [p for p in all_pairs if p["signal"] == sig_filter]
+    # Use effective signal — hte_signal when early exit mode, else raw signal
+    # But hte_signal is computed in enrichment loop below, so we need two passes
+    # Pass 1: quick count using raw signal (updated after enrichment)
     arb  = sum(1 for p in all_pairs if p["signal"] == "execute")
     bord = sum(1 for p in all_pairs if p["signal"] == "borderline")
     loss = sum(1 for p in all_pairs if p["signal"] == "loss")
@@ -742,9 +745,25 @@ def index():
             "hte_signal":   hte_signal,
             "hold_to_expiry": hold_to_expiry,
         })
-    return render_template_string(PAGE,
+    # Recount using effective signal after enrichment (respects hold_to_expiry toggle)
+    def eff_sig(p):
+        return p.get("hte_signal") if not hold_to_expiry and p.get("hte_signal") else p["signal"]
+
+    arb  = sum(1 for p in enriched if eff_sig(p) == "execute")
+    bord = sum(1 for p in enriched if eff_sig(p) == "borderline")
+    loss = sum(1 for p in enriched if eff_sig(p) == "loss")
+    best   = max((p.get("effective_pnl") or p["net_pnl"] for p in enriched), default=None)
+    maxann = max((p.get("effective_ann") or p["ann_ret"] for p in enriched), default=None)
+
+    # Also filter pairs list by effective signal
+    if sig_filter != "all":
+        pairs = [p for p in enriched if eff_sig(p) == sig_filter]
+    else:
+        pairs = enriched
+
+        return render_template_string(PAGE,
         expiries=state["expiries"], active=active,
-        d=d, chain=d.get("chain", []), pairs=enriched,
+        d=d, chain=d.get("liquid_chain", d.get("chain", [])), pairs=enriched,
         arb=arb, bord=bord, loss=loss,
         total=len(all_pairs),
         best=best, maxann=maxann,
@@ -1161,7 +1180,7 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
   </div>
   <div class="sb" style="background:#f0fdf4">
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px">
-    {% for p in pairs if p.signal == 'execute' %}
+    {% for p in pairs if (p.get('hte_signal') if not hold_to_expiry and p.get('hte_signal') else p.signal) == 'execute' %}
     <div style="background:#fff;border:1px solid #bbf7d0;border-radius:8px;padding:12px 14px">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
         <div>
@@ -1405,7 +1424,7 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
 {% if chain %}
 <div class="sec">
   <div class="sh" onclick="toggle('chain-body')">
-    <span>Option Chain — {{ active }} ({{ chain|length }} strikes) &nbsp;·&nbsp; Buy at Ask · Sell at Bid</span>
+    <span>Option Chain — {{ active }} · Top {{ chain|length }} strikes by OI &nbsp;·&nbsp; Buy at Ask · Sell at Bid</span>
     <span class="toggle-hint">click to expand/collapse</span>
   </div>
   <div id="chain-body"><div class="tw">
