@@ -694,17 +694,52 @@ def index():
         ic_amt  = p.get("impact_cost") or 0
         depth_c = p.get("depth_capacity")
         exec_score = 0
-        if sp_pct < 0.3: exec_score += 2
-        elif sp_pct < 0.7: exec_score += 1
-        if ic_amt < 200: exec_score += 2
-        elif ic_amt < 1000: exec_score += 1
-        if depth_c is None: exec_score += 0
-        elif depth_c >= lots_possible: exec_score += 2
-        elif depth_c > 0: exec_score += 1
-        if   exec_score >= 5: exec_difficulty = "🟢 Easy"
-        elif exec_score >= 3: exec_difficulty = "🟡 Medium"
-        elif exec_score >= 1: exec_difficulty = "🔴 Hard"
-        else:                 exec_difficulty = "⛔ Very Hard"
+        exec_reasons = []
+
+        # Spread width scoring
+        if sp_pct < 0.3:
+            exec_score += 2
+        elif sp_pct < 0.7:
+            exec_score += 1
+            exec_reasons.append(f"Spread {sp_pct:.1f}% is moderate")
+        elif sp_pct < 999:
+            exec_reasons.append(f"Wide spread {sp_pct:.1f}% — hard to fill at quoted price")
+
+        # Impact cost scoring
+        if ic_amt == 0 or ic_amt is None:
+            exec_reasons.append("No depth data — impact cost unknown")
+        elif ic_amt < 200:
+            exec_score += 2
+        elif ic_amt < 1000:
+            exec_score += 1
+            exec_reasons.append(f"Moderate impact cost ₹{ic_amt:,.0f}")
+        else:
+            exec_reasons.append(f"High impact cost ₹{ic_amt:,.0f} — market will move against you")
+
+        # Depth capacity scoring
+        if depth_c is None:
+            exec_reasons.append("Order book depth not available")
+        elif depth_c == 0:
+            exec_reasons.append("Zero lots fillable within 0.5% slippage")
+        elif depth_c >= lots_possible:
+            exec_score += 2
+        elif depth_c > 0:
+            exec_score += 1
+            exec_reasons.append(f"Depth only {depth_c} lots (you need {lots_possible})")
+
+        if   exec_score >= 5:
+            exec_difficulty = "🟢 Easy"
+        elif exec_score >= 3:
+            exec_difficulty = "🟡 Medium"
+            if not exec_reasons: exec_reasons.append("Some execution friction expected")
+        elif exec_score >= 1:
+            exec_difficulty = "🔴 Hard"
+            if not exec_reasons: exec_reasons.append("Multiple execution obstacles")
+        else:
+            exec_difficulty = "⛔ Very Hard"
+            if not exec_reasons: exec_reasons.append("Likely not executable at quoted prices")
+
+        exec_reason_str = " · ".join(exec_reasons) if exec_reasons else "Execution looks straightforward"
 
         # FIX 5: Quote staleness — flag if spread looks stale (zero volume proxy)
         # We don't have last_trade_time from optionchain, but flag zero-bid as suspect
@@ -737,6 +772,7 @@ def index():
             "oi_flag": oi_flag, "oi_pct": round(oi_pct, 2) if oi_pct else None,
             "oi_note": oi_note, "bottleneck_oi": bottleneck_oi,
             "exec_difficulty": exec_difficulty,
+            "exec_reason": exec_reason_str,
             "stale_flag": stale_flag,
             "adj_pnl_hte":  adj_pnl_hte,
             "adj_ann_hte":  adj_ann_hte,
@@ -789,32 +825,32 @@ def depthtest():
     try:
         from fyers_apiv3 import fyersModel
         fyers = fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=token, log_path="")
-        # Test with a known liquid symbol - 28-Apr-2026 expiry, 25000 strike
-        test_syms = [
-            "NSE:NIFTY26APR25000CE",
-            "NSE:NIFTY26APR25000PE",
-            "NSE:NIFTY2642825000CE",   # alternative weekly format
-            "NSE:NIFTY25APR2500CE",    # another possible format
-        ]
-        results = {}
-        for sym in test_syms:
-            try:
-                r = fyers.depth(data={"symbol": [sym], "ohlcv_flag": 0})
-                results[sym] = {
-                    "s": r.get("s"),
-                    "message": r.get("message",""),
-                    "has_data": bool(r.get("d")),
-                    "keys": list(r.get("d", {}).keys())[:3],
-                }
-            except Exception as e:
-                results[sym] = {"error": str(e)}
-        # Also try quotes API to find correct symbol format
-        try:
-            q = fyers.quotes(data={"symbols": "NSE:NIFTY50-INDEX"})
-            results["_quotes_test"] = {"s": q.get("s"), "sample_key": list(q.get("d",{}).keys())[:2]}
-        except Exception as e:
-            results["_quotes_test"] = {"error": str(e)}
-        return jsonify(results)
+
+        # Step 1: get a real option symbol from the live chain
+        r = fyers.optionchain(data={"symbol": "NSE:NIFTY50-INDEX", "strikecount": "", "timestamp": ""})
+        rows = r.get("data", {}).get("optionsChain", [])
+        # Find first CE with an actual symbol
+        test_sym = None
+        for row in rows:
+            if row.get("option_type") == "CE" and row.get("symbol") and row.get("ask", 0) > 0:
+                test_sym = row.get("symbol")
+                break
+
+        if not test_sym:
+            return jsonify({"error": "No live CE symbol found", "chain_rows": len(rows)})
+
+        # Step 2: try depth call with that symbol
+        dr = fyers.depth(data={"symbol": [test_sym], "ohlcv_flag": 0})
+
+        return jsonify({
+            "test_symbol": test_sym,
+            "depth_status": dr.get("s"),
+            "depth_message": dr.get("message",""),
+            "depth_code": dr.get("code",""),
+            "depth_data_keys": list(dr.get("d", {}).keys())[:5],
+            "depth_first_entry": list(dr.get("d", {}).values())[0] if dr.get("d") else None,
+            "full_response_sample": str(dr)[:500],
+        })
     except Exception as e:
         return jsonify({"exception": str(e)})
 
@@ -1210,7 +1246,8 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
       {% if p.lots_possible > 0 %}
       <div style="margin-top:8px;font-size:11px;color:#374151;line-height:1.6">
         <strong>Signal basis:</strong> {% if p.get('signal_basis')=='adj' %}✅ Confirmed using <em>impact-adjusted</em> P&L{% else %}Based on raw P&L (impact cost not yet computed){% endif %}<br>
-        <strong>Execution:</strong> {{ p.get('exec_difficulty','—') }}<br>
+        <strong>Execution:</strong> {{ p.get('exec_difficulty','—') }}
+        {% if p.get('exec_reason') %} — <span style="color:#64748b;font-size:11px">{{ p.get('exec_reason') }}</span>{% endif %}<br>
         <strong>Why executable:</strong>
         Box settles at ₹{{ "{:,}".format(p.box_value|int) }}. You pay ₹{{ "{:,}".format(p.net_debit|int) }} net debit.
         After all costs (Entry STT {{ inr(p.entry_stt) }} + Settl STT {{ inr(p.settl_stt) }} + other {{ inr(p.other_costs) }}),
@@ -1518,7 +1555,11 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
           <td style="color:#64748b">
             {% if p.get('bottleneck_oi') %}{{ "{:,}".format(p.bottleneck_oi|int) }} lots{% else %}<span class="na">—</span>{% endif %}
           </td>
-          <td title="{{ p.get('exec_difficulty','') }}">{{ p.get('exec_difficulty','—') }}
+          <td>
+            {{ p.get('exec_difficulty','—') }}
+            {% if p.get('exec_reason') %}
+            <br><span style="font-size:9px;color:#64748b;font-family:inherit;white-space:normal;display:block;max-width:160px;line-height:1.4">{{ p.get('exec_reason') }}</span>
+            {% endif %}
             {% if p.get('stale_flag') %}<br><span style="font-size:9px;color:#dc2626">{{ p.stale_flag }}</span>{% endif %}
           </td>
           {% set display_signal = p.get('hte_signal', p.signal) %}
