@@ -2017,44 +2017,6 @@ def livetest():
     except Exception as e:
         return jsonify({"exception": str(e)})
 
-@app.route("/depthtest")
-def depthtest():
-    token = load_token()
-    if not token:
-        return jsonify({"error": "No token"})
-    try:
-        from fyers_apiv3 import fyersModel
-        fyers = fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=token, log_path="")
-        # Test with a known liquid symbol - 28-Apr-2026 expiry, 25000 strike
-        test_syms = [
-            "NSE:NIFTY26APR25000CE",
-            "NSE:NIFTY26APR25000PE",
-            "NSE:NIFTY2642825000CE",   # alternative weekly format
-            "NSE:NIFTY25APR2500CE",    # another possible format
-        ]
-        results = {}
-        for sym in test_syms:
-            try:
-                r = fyers.depth(data={"symbol": [sym], "ohlcv_flag": 0})
-                results[sym] = {
-                    "s": r.get("s"),
-                    "message": r.get("message",""),
-                    "has_data": bool(r.get("d")),
-                    "keys": list(r.get("d", {}).keys())[:3],
-                }
-            except Exception as e:
-                results[sym] = {"error": str(e)}
-        # Also try quotes API to find correct symbol format
-        try:
-            q = fyers.quotes(data={"symbols": "NSE:NIFTY50-INDEX"})
-            results["_quotes_test"] = {"s": q.get("s"), "sample_key": list(q.get("d",{}).keys())[:2]}
-        except Exception as e:
-            results["_quotes_test"] = {"error": str(e)}
-        return jsonify(results)
-    except Exception as e:
-        return jsonify({"exception": str(e)})
-
-
 @app.route("/calc")
 def calc():
     # Get inputs from query params or use defaults
