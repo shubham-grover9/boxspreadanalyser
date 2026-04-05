@@ -452,10 +452,11 @@ def fetch_one(fyers, raw_expiry):
             for i in range(0, len(sym_list), 20):
                 batch = sym_list[i:i+20]
                 try:
-                    dr = fyers.depth(data={"symbol": batch, "ohlcv_flag": 0})
+                    # Fyers depth API requires comma-joined string, NOT a list
+                    dr = fyers.depth(data={"symbol": ",".join(batch), "ohlcv_flag": 0})
                     if dr.get("s") == "ok":
                         depth_map.update(dr.get("d", {}))
-                    time.sleep(0.15)  # gentle rate limiting between batches
+                    time.sleep(0.15)
                 except Exception:
                     pass
 
