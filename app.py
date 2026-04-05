@@ -370,6 +370,7 @@ def fetch_one(fyers, raw_expiry):
                 if cmp is None: cmp = row.get("ltp")
                 continue
             if k is None or k <= 0: continue
+            k = int(k)  # normalise to int — Fyers returns floats
             if k not in chain_dict:
                 chain_dict[k] = {"k": k, "cb": None, "ca": None,
                                   "pb": None, "pa": None,
@@ -390,7 +391,7 @@ def fetch_one(fyers, raw_expiry):
                 chain_dict[k]["pe_sym"] = row.get("symbol")
 
         for k, s in chain_dict.items():
-            chain_sym_map[k] = {"ce_sym": s.get("ce_sym"), "pe_sym": s.get("pe_sym")}
+            chain_sym_map[int(k)] = {"ce_sym": s.get("ce_sym"), "pe_sym": s.get("pe_sym")}
 
         chain = sorted(chain_dict.values(), key=lambda x: x["k"])
         dte   = expiry_dte(raw_expiry)
