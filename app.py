@@ -707,39 +707,43 @@ def index():
 
         # Impact cost scoring
         if ic_amt == 0 or ic_amt is None:
-            exec_reasons.append("No depth data — impact cost unknown")
+            # Don't penalise or explain missing depth — it's a known API limitation
+            # Impact cost unavailable — score neutrally, explain via spread only
+            pass
         elif ic_amt < 200:
             exec_score += 2
         elif ic_amt < 1000:
             exec_score += 1
-            exec_reasons.append(f"Moderate impact cost ₹{ic_amt:,.0f}")
+            exec_reasons.append(f"Moderate market impact ~₹{ic_amt:,.0f}")
         else:
-            exec_reasons.append(f"High impact cost ₹{ic_amt:,.0f} — market will move against you")
+            exec_reasons.append(f"High market impact ~₹{ic_amt:,.0f} — your order will move prices")
 
         # Depth capacity scoring
         if depth_c is None:
-            exec_reasons.append("Order book depth not available")
+            # Known limitation — don't surface as a reason
+            pass
         elif depth_c == 0:
-            exec_reasons.append("Zero lots fillable within 0.5% slippage")
+            exec_reasons.append("Zero lots fillable at quoted price — strike is effectively illiquid")
         elif depth_c >= lots_possible:
             exec_score += 2
         elif depth_c > 0:
             exec_score += 1
-            exec_reasons.append(f"Depth only {depth_c} lots (you need {lots_possible})")
+            exec_reasons.append(f"Book can only absorb {depth_c} lots (you need {lots_possible})")
 
         if   exec_score >= 5:
             exec_difficulty = "🟢 Easy"
         elif exec_score >= 3:
             exec_difficulty = "🟡 Medium"
-            if not exec_reasons: exec_reasons.append("Some execution friction expected")
         elif exec_score >= 1:
             exec_difficulty = "🔴 Hard"
-            if not exec_reasons: exec_reasons.append("Multiple execution obstacles")
+            if not exec_reasons:
+                exec_reasons.append("Wide bid-ask spread — quoted price may not be your fill price")
         else:
             exec_difficulty = "⛔ Very Hard"
-            if not exec_reasons: exec_reasons.append("Likely not executable at quoted prices")
+            if not exec_reasons:
+                exec_reasons.append("Very wide spread — execution at theoretical price is unlikely")
 
-        exec_reason_str = " · ".join(exec_reasons) if exec_reasons else "Execution looks straightforward"
+        exec_reason_str = " · ".join(exec_reasons) if exec_reasons else ""
 
         # FIX 5: Quote staleness — flag if spread looks stale (zero volume proxy)
         # We don't have last_trade_time from optionchain, but flag zero-bid as suspect
@@ -826,33 +830,36 @@ def depthtest():
         from fyers_apiv3 import fyersModel
         fyers = fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=token, log_path="")
 
-        # Step 1: get a real option symbol from the live chain
+        # Get real symbols from chain
         r = fyers.optionchain(data={"symbol": "NSE:NIFTY50-INDEX", "strikecount": "", "timestamp": ""})
         rows = r.get("data", {}).get("optionsChain", [])
-        # Find first CE with an actual symbol
-        test_sym = None
-        for row in rows:
-            if row.get("option_type") == "CE" and row.get("symbol") and row.get("ask", 0) > 0:
-                test_sym = row.get("symbol")
-                break
 
-        if not test_sym:
-            return jsonify({"error": "No live CE symbol found", "chain_rows": len(rows)})
+        # Collect first 3 CE symbols and their raw fields
+        ce_rows = [row for row in rows if row.get("option_type") == "CE" and row.get("ask",0) > 0][:3]
+        sample_syms = [row.get("symbol") for row in ce_rows if row.get("symbol")]
+        sample_fyTokens = [row.get("fyToken") for row in ce_rows if row.get("fyToken")]
 
-        # Step 2: try depth call with that symbol
-        dr = fyers.depth(data={"symbol": [test_sym], "ohlcv_flag": 0})
+        results = {"chain_sample_symbols": sample_syms, "chain_sample_fyTokens": sample_fyTokens}
 
-        return jsonify({
-            "test_symbol": test_sym,
-            "depth_status": dr.get("s"),
-            "depth_message": dr.get("message",""),
-            "depth_code": dr.get("code",""),
-            "depth_data_keys": list(dr.get("d", {}).keys())[:5],
-            "depth_first_entry": list(dr.get("d", {}).values())[0] if dr.get("d") else None,
-            "full_response_sample": str(dr)[:500],
-        })
+        # Try depth with the exact symbol string from optionchain
+        if sample_syms:
+            d1 = fyers.depth(data={"symbol": [sample_syms[0]], "ohlcv_flag": 0})
+            results["depth_with_symbol"] = {"s": d1.get("s"), "msg": d1.get("message",""), "data": str(d1)[:200]}
+
+        # Try quotes API instead — may work where depth doesn't
+        if sample_syms:
+            q1 = fyers.quotes(data={"symbols": sample_syms[0]})
+            results["quotes_with_symbol"] = {"s": q1.get("s"), "msg": q1.get("message",""), "data": str(q1)[:300]}
+
+        # Try depth with comma-separated string instead of list
+        if sample_syms:
+            d2 = fyers.depth(data={"symbol": sample_syms[0], "ohlcv_flag": 0})
+            results["depth_as_string"] = {"s": d2.get("s"), "msg": d2.get("message",""), "data": str(d2)[:200]}
+
+        return jsonify(results)
     except Exception as e:
-        return jsonify({"exception": str(e)})
+        import traceback
+        return jsonify({"exception": str(e), "trace": traceback.format_exc()})
 
 
 @app.route("/calc")
@@ -1557,8 +1564,9 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
           </td>
           <td>
             {{ p.get('exec_difficulty','—') }}
-            {% if p.get('exec_reason') %}
-            <br><span style="font-size:9px;color:#64748b;font-family:inherit;white-space:normal;display:block;max-width:160px;line-height:1.4">{{ p.get('exec_reason') }}</span>
+            {% set er = p.get('exec_reason','') %}
+            {% if er %}
+            <br><span style="font-size:9px;color:#64748b;font-family:inherit;white-space:normal;display:block;max-width:180px;line-height:1.4;margin-top:2px">{{ er }}</span>
             {% endif %}
             {% if p.get('stale_flag') %}<br><span style="font-size:9px;color:#dc2626">{{ p.stale_flag }}</span>{% endif %}
           </td>
