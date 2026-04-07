@@ -443,32 +443,43 @@ def fetch_one(fyers, raw_expiry):
             all_syms = set()
             for p in candidates:
                 for k in [p["k1"], p["k2"]]:
-                    sm = chain_sym_map.get(k, {})
+                    sm = chain_sym_map.get(int(k), {})
                     if sm.get("ce_sym"): all_syms.add(sm["ce_sym"])
                     if sm.get("pe_sym"): all_syms.add(sm["pe_sym"])
 
             # Batch into groups of 20 and fetch
             sym_list  = list(all_syms)
             depth_map = {}
+            depth_errors = []
+            print(f"[DEPTH] Fetching depth for {len(sym_list)} symbols across {len(candidates)} candidates")
             for i in range(0, len(sym_list), 20):
                 batch = sym_list[i:i+20]
                 try:
-                    # Fyers depth API requires comma-joined string, NOT a list
                     dr = fyers.depth(data={"symbol": ",".join(batch), "ohlcv_flag": 0})
                     if dr.get("s") == "ok":
                         depth_map.update(dr.get("d", {}))
+                        print(f"[DEPTH] Batch {i//20+1}: got {len(dr.get('d',{}))} entries")
+                    else:
+                        depth_errors.append(f"Batch {i//20+1}: {dr.get('message','')}")
+                        print(f"[DEPTH] Batch {i//20+1} error: {dr.get('message','')}")
                     time.sleep(0.15)
-                except Exception:
-                    pass
+                except Exception as e:
+                    depth_errors.append(str(e))
+                    print(f"[DEPTH] Exception: {e}")
+            print(f"[DEPTH] Total symbols in depth_map: {len(depth_map)}")
 
             # ── STAGE 2: IMPACT COST + DEPTH CAPACITY FOR ALL CANDIDATES ─────
+            # Capital-aware: use lots_possible from capital (passed via pair) if available
+            # else fall back to PARAMS num_lots
             lots          = PARAMS["lot_size"] * PARAMS["num_lots"]
-            desired_lots  = PARAMS["num_lots"]
             baseline_slip = 4 * PARAMS["slip_per_leg"] * PARAMS["lot_size"] * PARAMS["num_lots"]
 
             for p in candidates:
-                s1 = chain_sym_map.get(p["k1"], {})
-                s2 = chain_sym_map.get(p["k2"], {})
+                s1 = chain_sym_map.get(int(p["k1"]), {})
+                s2 = chain_sym_map.get(int(p["k2"]), {})
+                # Capital-aware: impact cost should reflect actual intended position size
+                # This is stored on the pair after enrichment; use num_lots as proxy here
+                desired_lots = p.get("capital_lots", PARAMS["num_lots"])
                 legs = [
                     (s1.get("ce_sym", ""), "buy"),
                     (s2.get("ce_sym", ""), "sell"),
@@ -769,6 +780,28 @@ def index():
                 hte_signal = "borderline"
         else:
             hte_signal = p["signal"]
+
+        # 1-line signal reason
+        raw_sig = p["signal"]
+        eff = hte_signal
+        if eff == "execute":
+            signal_reason = f"Ann% {p['ann_ret']:.1f}% beats {PARAMS['min_ann_ret']}% min · spread {p.get('spread_pct',0):.1f}% is tight"
+        elif eff == "borderline":
+            if p["net_pnl"] <= 0:
+                signal_reason = "Net loss after all costs including settlement STT"
+            elif p["ann_ret"] < PARAMS["min_ann_ret"]:
+                signal_reason = f"Returns {p['ann_ret']:.1f}% p.a. — below {PARAMS['min_ann_ret']}% target"
+            elif (p.get("spread_pct") or 99) >= PARAMS["max_spread_pct"]:
+                signal_reason = f"Spread {p.get('spread_pct',0):.1f}% too wide — quoted price may not be your fill"
+            elif p.get("signal_basis") == "adj":
+                signal_reason = f"Impact cost reduces adj return below threshold"
+            else:
+                signal_reason = "Marginally profitable but below execution quality threshold"
+        else:
+            if p["net_pnl"] <= 0:
+                signal_reason = "Net loss — settlement STT alone wipes the profit margin"
+            else:
+                signal_reason = f"Ann% {p['ann_ret']:.1f}% is negative or near zero after all costs"
 
         enriched.append({**p,
             "lots_possible": lots_possible,
@@ -1510,44 +1543,43 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
 <!-- BOX SPREAD TABLE -->
 <div class="sec">
   <div class="sh sh-static">
-    <span>Box Spread Analysis — {{ pairs|length }} pairs &nbsp;·&nbsp; Capital ₹{{ "{:,.0f}".format(capital) }} &nbsp;·&nbsp; Tax {{ tax_rate|int }}% &nbsp;·&nbsp; Sorted by Ann. Return ↓</span>
+    <span>Box Spread Analysis — {{ pairs|length }} pairs &nbsp;·&nbsp; ₹{{ "{:,.0f}".format(capital) }} &nbsp;·&nbsp; Tax {{ tax_rate|int }}% &nbsp;·&nbsp; Sorted by Ann. Return ↓</span>
   </div>
   <div class="tw">
     <table>
       <thead><tr>
-        <th class="l group-a">K1</th><th class="l group-a">K2</th><th class="group-a">Width</th><th class="group-a">DTE</th>
-        <th class="group-a">C Ask(K1)</th><th class="group-a">C Bid(K2)</th><th class="group-a">P Ask(K2)</th><th class="group-a">P Bid(K1)</th>
-        <th class="group-b">Net Debit</th><th class="group-b">Box Value</th>
-        <th class="group-b">Entry STT</th><th class="group-b">Settl STT</th><th class="group-b">Other Costs</th>
+        <th class="l group-a">K1</th>
+        <th class="l group-a">K2</th>
+        <th class="group-a">Width</th>
+        <th class="group-a">DTE</th>
+        <th class="group-b">Net Debit</th>
+        <th class="group-b">Total Costs</th>
         <th class="group-c">Net P&L/lot</th>
-        {% if not hold_to_expiry %}<th class="group-c" title="P&L after closing early — settlement STT saved, exit spread cost deducted">Early Exit P&L</th>{% endif %}
-        <th class="group-c">Return%</th><th class="group-c">Ann.%</th><th class="group-c">Post-Tax Ann%</th>
-        <th class="group-c">Spread%</th>
-        <th class="group-d">Impact Cost</th><th class="group-d">Adj P&L</th>
-        <th class="group-e">Max Lots</th><th class="group-e">Total P&L deployed</th>
-        <th class="group-e">OI Liquidity</th><th class="group-e">Bottleneck OI</th>
-        <th class="group-e">Exec Difficulty</th>
+        <th class="group-c">Ann.%</th>
+        <th class="group-c">Post-Tax%</th>
+        <th class="group-d">Impact Cost</th>
+        <th class="group-d">Adj P&L</th>
+        <th class="group-e">Max Lots</th>
+        <th class="group-e">Total P&L</th>
+        <th class="group-e">OI</th>
+        <th class="group-e">Exec</th>
         <th>Signal</th>
+        <th class="l">Why</th>
       </tr></thead>
       <tbody>
       {% if pairs %}{% for p in pairs %}
+        {% set display_signal = p.get('hte_signal', p.signal) %}
+        {% set total_costs = (p.entry_stt or 0) + (p.settl_stt or 0) + (p.other_costs or 0) %}
         <tr>
           <td class="l">{{ "{:,}".format(p.k1|int) }}</td>
           <td class="l">{{ "{:,}".format(p.k2|int) }}</td>
           <td>{{ "{:,}".format(p.box_w|int) }}</td>
           <td>{{ d.get('dte','?') }}</td>
-          <td>{{ "%.2f"|format(p.ca1) }}</td><td>{{ "%.2f"|format(p.cb2) }}</td>
-          <td>{{ "%.2f"|format(p.pa2) }}</td><td>{{ "%.2f"|format(p.pb1) }}</td>
-          <td>{{ inr(p.net_debit) }}</td><td>{{ inr(p.box_value) }}</td>
-          <td>{{ inr(p.entry_stt) }}</td><td>{{ inr(p.settl_stt) }}</td><td>{{ inr(p.other_costs) }}</td>
+          <td>{{ inr(p.net_debit) }}</td>
+          <td title="Entry STT {{ inr(p.entry_stt) }} + Settl STT {{ inr(p.settl_stt) }} + Other {{ inr(p.other_costs) }}">{{ inr(total_costs) }}</td>
           <td style="font-weight:700;color:{% if p.net_pnl>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ inr(p.net_pnl) }}</td>
-          {% if not p.get('hold_to_expiry', True) and p.get('adj_pnl_hte') is not none %}
-          <td style="font-weight:700;color:{% if p.adj_pnl_hte>=0 %}#16a34a{% else %}#dc2626{% endif %}" title="P&L if closed before expiry (no settlement STT, includes exit spread cost)">{{ inr(p.adj_pnl_hte) }} <span style="font-size:9px;color:#64748b">early exit</span></td>
-          {% endif %}
-          <td style="color:{% if p.ret_pct>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.ret_pct) }}</td>
           <td style="font-weight:700;color:{% if p.ann_ret>=params.rfr %}#16a34a{% elif p.ann_ret>=0 %}#d97706{% else %}#dc2626{% endif %}">{{ pct(p.ann_ret) }}</td>
           <td style="color:{% if p.post_tax_ann and p.post_tax_ann>=0 %}#16a34a{% else %}#dc2626{% endif %}">{{ pct(p.post_tax_ann) }}</td>
-          <td>{% if p.spread_pct is not none %}{{ "%.2f"|format(p.spread_pct) }}%{% else %}<span class="na">—</span>{% endif %}</td>
           <td style="color:{% if p.get('impact_cost') and p.get('impact_cost',0)>2000 %}#dc2626{% elif p.get('impact_cost') and p.get('impact_cost',0)>500 %}#d97706{% else %}#16a34a{% endif %}">
             {% if p.get('impact_cost') is not none %}{{ inr(p.get('impact_cost')) }}{% else %}<span class="na">—</span>{% endif %}
           </td>
@@ -1560,31 +1592,23 @@ function toggle(id){var el=document.getElementById(id);el.style.display=el.style
           <td style="font-weight:700;color:{% if p.adj_total_pnl is not none and p.adj_total_pnl>=0 %}#16a34a{% else %}#dc2626{% endif %}">
             {% if p.adj_total_pnl is not none %}{{ inr(p.adj_total_pnl) }}{% elif p.total_pnl is not none %}{{ inr(p.total_pnl) }}{% else %}<span class="na">—</span>{% endif %}
           </td>
-          <td title="{{ p.get('oi_note','') }}">{{ p.get('oi_flag','—') }}</td>
-          <td style="color:#64748b">
-            {% if p.get('bottleneck_oi') %}{{ "{:,}".format(p.bottleneck_oi|int) }} lots{% else %}<span class="na">—</span>{% endif %}
-          </td>
+          <td title="{{ p.get('oi_note','') }}" style="font-size:11px">{{ p.get('oi_flag','—') }}</td>
           <td>
             {{ p.get('exec_difficulty','—') }}
             {% set er = p.get('exec_reason','') %}
-            {% if er %}
-            <br><span style="font-size:9px;color:#64748b;font-family:inherit;white-space:normal;display:block;max-width:180px;line-height:1.4;margin-top:2px">{{ er }}</span>
-            {% endif %}
-            {% if p.get('stale_flag') %}<br><span style="font-size:9px;color:#dc2626">{{ p.stale_flag }}</span>{% endif %}
+            {% if er %}<br><span style="font-size:9px;color:#64748b;white-space:normal;display:block;max-width:120px;line-height:1.3">{{ er }}</span>{% endif %}
           </td>
-          {% set display_signal = p.get('hte_signal', p.signal) %}
           <td>
-            {% if display_signal=='execute' %}
-              <span class="pill pg">✅ EXECUTE{% if p.get('signal_basis')=='adj' %} (adj){% endif %}</span>
-            {% elif display_signal=='borderline' %}
-              <span class="pill pa">⚠ BORDERLINE{% if p.get('signal_basis')=='adj' %} (adj){% endif %}</span>
-            {% else %}
-              <span class="pill pr">❌ AVOID</span>
-            {% endif %}
+            {% if display_signal=='execute' %}<span class="pill pg">✅ EXECUTE{% if p.get('signal_basis')=='adj' %} (adj){% endif %}</span>
+            {% elif display_signal=='borderline' %}<span class="pill pa">⚠ BORDERLINE{% if p.get('signal_basis')=='adj' %} (adj){% endif %}</span>
+            {% else %}<span class="pill pr">❌ AVOID</span>{% endif %}
+          </td>
+          <td class="l" style="font-size:11px;color:#475569;max-width:200px;white-space:normal;line-height:1.4">
+            {{ p.get('signal_reason','') }}
           </td>
         </tr>
       {% endfor %}{% else %}
-        <tr><td colspan="25"><div class="empty">{% if not authenticated %}Login at /admin{% elif not active %}Select an expiry{% else %}No pairs match this filter{% endif %}</div></td></tr>
+        <tr><td colspan="17"><div class="empty">{% if not authenticated %}Login at /admin{% elif not active %}Select an expiry{% else %}No pairs match this filter{% endif %}</div></td></tr>
       {% endif %}
       </tbody>
     </table>
