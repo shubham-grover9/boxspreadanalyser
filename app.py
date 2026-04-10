@@ -646,9 +646,8 @@ def index():
         capital = 300000.0
     hold_to_expiry = request.args.get("hold", "1") != "0"
     # Filter pairs
-    pairs = all_pairs if sig_filter == "all" else [p for p in all_pairs if p["signal"] == sig_filter]
-    # Use effective signal — hte_signal when early exit mode, else raw signal
-    # But hte_signal is computed in enrichment loop below, so we need two passes
+    pairs = all_pairs  # always enrich all pairs; filter by effective signal after enrichment
+    # Effective signal (hte_signal) is computed in enrichment loop below
     # Pass 1: quick count using raw signal (updated after enrichment)
     arb  = sum(1 for p in all_pairs if p["signal"] == "execute")
     bord = sum(1 for p in all_pairs if p["signal"] == "borderline")
@@ -784,24 +783,30 @@ def index():
         # 1-line signal reason
         raw_sig = p["signal"]
         eff = hte_signal
-        if eff == "execute":
-            signal_reason = f"Ann% {p['ann_ret']:.1f}% beats {PARAMS['min_ann_ret']}% min · spread {p.get('spread_pct',0):.1f}% is tight"
-        elif eff == "borderline":
-            if p["net_pnl"] <= 0:
-                signal_reason = "Net loss after all costs including settlement STT"
-            elif p["ann_ret"] < PARAMS["min_ann_ret"]:
-                signal_reason = f"Returns {p['ann_ret']:.1f}% p.a. — below {PARAMS['min_ann_ret']}% target"
-            elif (p.get("spread_pct") or 99) >= PARAMS["max_spread_pct"]:
-                signal_reason = f"Spread {p.get('spread_pct',0):.1f}% too wide — quoted price may not be your fill"
-            elif p.get("signal_basis") == "adj":
-                signal_reason = f"Impact cost reduces adj return below threshold"
+        ann  = p.get("ann_ret") or 0
+        npnl = p.get("net_pnl") or 0
+        sp   = p.get("spread_pct") or 0
+        try:
+            if eff == "execute":
+                signal_reason = f"Ann% {ann:.1f}% beats {PARAMS['min_ann_ret']}% target · spread {sp:.1f}% is tight enough"
+            elif eff == "borderline":
+                if npnl <= 0:
+                    signal_reason = "Net loss after all costs including settlement STT"
+                elif ann < PARAMS["min_ann_ret"]:
+                    signal_reason = f"Returns {ann:.1f}% p.a. — below {PARAMS['min_ann_ret']}% target"
+                elif sp >= PARAMS["max_spread_pct"]:
+                    signal_reason = f"Spread {sp:.1f}% too wide — quoted price may not be your fill"
+                elif p.get("signal_basis") == "adj":
+                    signal_reason = "Impact cost reduces adjusted return below threshold"
+                else:
+                    signal_reason = "Marginally profitable but below execution quality threshold"
             else:
-                signal_reason = "Marginally profitable but below execution quality threshold"
-        else:
-            if p["net_pnl"] <= 0:
-                signal_reason = "Net loss — settlement STT alone wipes the profit margin"
-            else:
-                signal_reason = f"Ann% {p['ann_ret']:.1f}% is negative or near zero after all costs"
+                if npnl <= 0:
+                    signal_reason = "Net loss — settlement STT wipes the profit margin"
+                else:
+                    signal_reason = f"Ann% {ann:.1f}% — too low after all costs"
+        except Exception:
+            signal_reason = ""
 
         enriched.append({**p,
             "lots_possible": lots_possible,
